@@ -1,0 +1,23 @@
+SPACELINE WORKSPACE 0.9.4 — UPGRADE NOTES
+
+Main fix
+- The previous copy cleanup could run forever because Chromium serializes SVG markup differently after parsing. 0.9.4 checks the SVG DOM structure instead.
+- Every completed assistant reply now settles to exactly one icon-only note button beneath the full reply.
+- The button copies the original complete Markdown content, including prompts, explanations and code blocks.
+- Stale legacy copy buttons are removed even if inserted after the reply is first rendered.
+
+Research and workspace
+- Web Search uses two independent initial search angles and up to 8 model tool rounds.
+- Deep Research uses three initial search angles and up to 14 model tool rounds.
+- The private headless Chromium research session remains available, but is not shown automatically in the Browser tab.
+- An explicit request to open/show/use the browser reveals the Browser workbench, even with a research mode selected.
+- Review tab selection is remembered after reload.
+
+Install
+1. Stop any running Spaceline terminal with Ctrl+C.
+2. Extract this ZIP into a new folder (recommended) or overwrite the old source folder after backing it up.
+3. Run start.bat.
+4. Open the exact URL printed by the launcher. It scans ports 8765–8799 and may choose a different one if an older process is still running.
+5. Hard-refresh the browser once if an older page is still open (Ctrl+Shift+R).
+
+Your existing data remains in Documents\Spaceline unless you changed SPACELINE_WORKSPACE_DIR.

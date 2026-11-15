@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Spaceline — Your local-first orbital AI workspace</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+<style>
+:root{--void:#0E1311;--deep:#141B18;--line:rgba(255,255,255,.08);--ink:#F3F6F4;--em:#8FE35A;--gold:#D7B84A;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html{background:var(--void);scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;min-height:100vh;background:var(--void);color:var(--ink);font-family:'Space Grotesk',sans-serif;overflow-x:hidden;-webkit-tap-highlight-color:transparent}
+.mono{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.06em}
+#bg{position:fixed;inset:0;width:100%;height:100%;z-index:0}
+.vig{position:fixed;inset:0;z-index:2;pointer-events:none;background:radial-gradient(ellipse at 50% 46%,transparent 35%,rgba(14,19,17,.85) 100%)}
+.fl{position:fixed;left:0;top:0;z-index:1;pointer-events:none;opacity:0;font:11px/1.5 'JetBrains Mono',monospace;padding:8px 11px;border-radius:12px;background:rgba(25,33,29,.55);border:1px solid var(--line);backdrop-filter:blur(8px);color:rgba(243,246,244,.7);white-space:nowrap;will-change:transform}
+.fl .k{color:var(--gold)}.fl .s{color:var(--em)}.fl .t{color:var(--ink);margin-bottom:6px}.fl .ln{height:3px;border-radius:2px;background:rgba(255,255,255,.14);margin-top:5px}
+.fl .bar{width:90px;height:3px;background:rgba(255,255,255,.12);border-radius:2px;margin-top:5px}.fl .bar i{display:block;height:100%;background:var(--em);border-radius:2px}
+.fl.wrap{white-space:normal;width:170px;font-family:'Space Grotesk',sans-serif;font-size:12px}
+/* cursor */
+#cr,#cd{display:none;position:fixed;left:0;top:0;pointer-events:none;z-index:99}
+@media(hover:hover) and (pointer:fine){html,body,*{cursor:none!important}#cr,#cd{display:block}}
+#cr{border:1px solid rgba(243,246,244,.42);border-radius:999px;transition:border-radius .3s,border-color .3s,background .3s}
+#cr.on{border-color:rgba(143,227,90,.8);background:rgba(143,227,90,.06)}
+#cd{width:5px;height:5px;margin:-2.5px 0 0 -2.5px;border-radius:50%;background:var(--em);box-shadow:0 0 10px var(--em)}
+/* logo */
+#logo{position:relative;width:108px;height:108px;display:flex;align-items:center;justify-content:center}
+#logo .ob{position:absolute;inset:0;border-radius:50%;border:1px dashed rgba(143,227,90,.28);animation:spin 18s linear infinite}
+#logo .ob::after{content:"";position:absolute;top:-3px;left:50%;width:6px;height:6px;margin-left:-3px;border-radius:50%;background:var(--em);box-shadow:0 0 12px var(--em)}
+#logo .ob2{position:absolute;inset:12px;border-radius:50%;border:1px solid rgba(215,184,74,.18);animation:spin 28s linear infinite reverse}
+#logo .ob2::after{content:"";position:absolute;bottom:-2px;left:50%;width:4px;height:4px;margin-left:-2px;border-radius:50%;background:var(--gold)}
+@keyframes spin{to{transform:rotate(360deg)}}
+#lsvg{position:relative;width:46px;height:56px;overflow:visible;animation:br 5s ease-in-out infinite}
+@keyframes br{0%,100%{transform:scale(1);filter:drop-shadow(0 0 4px rgba(143,227,90,.18))}50%{transform:scale(1.045);filter:drop-shadow(0 0 16px rgba(143,227,90,.5))}}
+.shim path{fill:none;stroke:var(--em);stroke-width:1.4;stroke-dasharray:16 142;animation:dash 4.2s linear infinite}
+.shim path:nth-child(2){animation-delay:-1.4s;stroke:var(--gold)}.shim path:nth-child(3){animation-delay:-2.8s}
+#logo:hover .shim path{animation-duration:1.6s}
+@keyframes dash{to{stroke-dashoffset:-158}}
+.word{font-weight:700;letter-spacing:-.05em;font-size:clamp(34px,6vw,46px);line-height:1;display:flex}
+/* card */
+.card{position:relative;background:rgba(25,33,29,.65);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border:1px solid rgba(255,255,255,.08);border-radius:24px;box-shadow:0 40px 90px -30px rgba(0,0,0,.8),inset 0 1px 0 rgba(255,255,255,.06)}
+.card::before{content:"";position:absolute;inset:-1px;border-radius:inherit;padding:1px;pointer-events:none;background:radial-gradient(300px circle at var(--mx,50%) var(--my,0%),rgba(143,227,90,.95),rgba(215,184,74,.4) 45%,transparent 72%);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude}
+.card::after{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:radial-gradient(380px circle at var(--mx,50%) var(--my,0%),rgba(143,227,90,.07),transparent 70%)}
+.f{position:relative;margin-bottom:14px}
+.f input{width:100%;height:54px;padding:20px 46px 6px 16px;border-radius:14px;background:rgba(14,19,17,.6);border:1px solid var(--line);color:var(--ink);font:500 15px 'Space Grotesk',sans-serif;outline:none;transition:border-color .25s,box-shadow .25s}
+.f label{position:absolute;left:16px;top:17px;font-size:15px;color:rgba(243,246,244,.45);pointer-events:none;transform-origin:left;transition:transform .25s cubic-bezier(.2,.8,.2,1),color .25s}
+.f input:focus+label,.f input:not(:placeholder-shown)+label{transform:translateY(-10px) scale(.74);color:var(--em)}
+.f input:focus{border-color:rgba(143,227,90,.55);box-shadow:0 0 0 3px rgba(143,227,90,.08),0 0 24px -6px rgba(143,227,90,.4)}
+.f .hr{position:absolute;left:14px;right:14px;bottom:0;height:1px;background:linear-gradient(90deg,transparent,var(--em),transparent);transform:scaleX(0);transition:transform .4s;pointer-events:none}
+.f input:focus~.hr{transform:scaleX(1)}
+.f.bad input{border-color:rgba(255,120,96,.6)}.f.ok input{border-color:rgba(143,227,90,.35)}
+.f .ck{position:absolute;right:16px;top:19px;width:16px;height:16px;opacity:0;transform:scale(.4);transition:.3s cubic-bezier(.3,1.6,.5,1);color:var(--em)}
+.f.ok .ck{opacity:1;transform:scale(1)}.f.pw .ck{right:46px}
+.err{display:block;height:0;overflow:hidden;font:11px 'JetBrains Mono',monospace;color:#ff8a70;padding-left:4px;transition:height .25s,margin .25s}
+.f.bad .err{height:16px;margin-top:5px}
+#eye{position:absolute;right:8px;top:12px;width:30px;height:30px;border:0;background:none;color:rgba(243,246,244,.55);display:grid;place-items:center;border-radius:8px;transition:color .2s}
+#eye:hover{color:var(--em)}#eye svg{width:18px;height:18px}
+#eye .sl{stroke-dasharray:24;stroke-dashoffset:0;transition:stroke-dashoffset .35s}#eye .pu{transform-origin:12px 12px;transition:transform .3s}
+#eye.on .sl{stroke-dashoffset:24}#eye.on .pu{transform:scale(1.25)}
+.btn{position:relative;overflow:hidden;width:100%;height:52px;border:0;border-radius:14px;font:600 15px 'Space Grotesk',sans-serif;color:#0E1311;background:linear-gradient(180deg,#A6F26F,#8FE35A);box-shadow:0 10px 30px -10px rgba(143,227,90,.5),inset 0 1px 0 rgba(255,255,255,.5);display:flex;align-items:center;justify-content:center;gap:8px}
+.btn .shine{position:absolute;inset:0;background:linear-gradient(105deg,transparent 35%,rgba(255,255,255,.6) 50%,transparent 65%);transform:translateX(-130%);pointer-events:none}
+.btn:hover .shine{transform:translateX(130%);transition:transform .9s}
+.btn .lab{transition:opacity .2s,transform .3s}.btn .spin{position:absolute;width:26px;height:26px;opacity:0;transform:scale(.5);transition:.3s}
+.btn.load .lab{opacity:0;transform:translateY(-8px)}.btn.load .spin{opacity:1;transform:scale(1)}.spin .orb{transform-origin:12px 12px;animation:spin .8s linear infinite}
+.div{display:flex;align-items:center;gap:12px;margin:20px 0;color:rgba(243,246,244,.4)}.div i{flex:1;height:1px;background:var(--line)}
+.oa{position:relative;overflow:hidden;height:48px;border-radius:12px;border:1px solid var(--line);color:var(--ink);font:500 14px 'Space Grotesk',sans-serif;display:flex;align-items:center;justify-content:center;gap:9px;background:radial-gradient(130px circle at var(--mx,50%) var(--my,50%),transparent,transparent),rgba(255,255,255,.03);transition:border-color .25s,translate .25s,background .25s,box-shadow .25s}
+.oa:hover{translate:0 -2px;border-color:rgba(143,227,90,.5);background:radial-gradient(130px circle at var(--mx) var(--my),rgba(143,227,90,.18),transparent 70%),rgba(255,255,255,.04);box-shadow:0 14px 30px -14px rgba(143,227,90,.35)}
+.oa svg{width:18px;height:18px}
+.pill{display:inline-flex;gap:8px;align-items:center;padding:7px 12px;border-radius:999px;background:rgba(25,33,29,.6);backdrop-filter:blur(12px);border:1px solid var(--line);color:rgba(243,246,244,.6);transition:.3s;pointer-events:auto}
+.pill:hover{border-color:rgba(215,184,74,.5);color:var(--ink);box-shadow:0 0 20px -6px rgba(215,184,74,.4)}
+.pill b{width:6px;height:6px;border-radius:50%;background:var(--em);box-shadow:0 0 8px var(--em);animation:pl 2.4s ease-in-out infinite}
+@keyframes pl{50%{opacity:.3}}
+a.lk{color:rgba(243,246,244,.55);transition:color .2s}a.lk:hover{color:var(--em)}
+:focus-visible{outline:2px solid var(--em);outline-offset:2px}
+@media(prefers-reduced-motion:reduce){#lsvg,.ob,.ob2,.shim path{animation:none}}
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<div id="float"></div>
+<div class="vig"></div>
+<div id="cr"></div><div id="cd"></div>
+
+<section id="authGate"><header class="fixed top-0 inset-x-0 z-20 flex justify-between items-center px-5 sm:px-8 pointer-events-none mono text-white/50" style="padding-top:calc(env(safe-area-inset-top,0px) + 18px)">
+  <div class="pill"><b></b><span>SYS.STATUS // READY</span></div>
+  <span id="xy" class="hidden sm:inline">X +000 / Y +000</span>
+</header>
+
+<main class="relative z-10 min-h-screen flex flex-col items-center justify-center px-5 pt-24 pb-28">
+  <div id="logo" data-m="circle" aria-label="Spaceline">
+    <div class="ob"></div><div class="ob2"></div>
+    <!-- Spaceline mark -->
+    <svg id="lsvg" viewBox="0 0 56 68" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path class="pl-top" d="M28 0L54 15L40 23L28 16L14 24L0 16L28 0Z" fill="#F3F6F4"/>
+      <path class="pl-mid" d="M0 22L28 38L56 22L56 32L28 48L0 32V22Z" fill="#8FE35A" fill-opacity=".85"/>
+      <path class="pl-bot" d="M28 68L2 53L16 45L28 52L42 44L56 52L28 68Z" fill="#F3F6F4"/>
+      <g class="shim"><path pathLength="158" d="M28 0L54 15L40 23L28 16L14 24L0 16L28 0Z"/><path pathLength="158" d="M0 22L28 38L56 22L56 32L28 48L0 32V22Z"/><path pathLength="158" d="M28 68L2 53L16 45L28 52L42 44L56 52L28 68Z"/></g>
+    </svg>
+  </div>
+  <h1 id="word" class="word mt-4" aria-label="Spaceline">SPACELINE</h1>
+  <p id="tag" class="mt-2 text-[15px] text-white/55">Your local-first orbital AI workspace</p>
+
+  <div id="tilt" class="w-full max-w-[420px] mt-8">
+    <div id="card" class="card p-6 sm:p-8">
+  <div class="flex justify-between mono text-white/40 in">
+    <span>AUTH // SESSION</span><span id="clk">00:00:00 UTC</span>
+  </div>
+  <h2 id="authTitle" class="in text-[26px] font-semibold tracking-tight mt-3 mb-1">Welcome back</h2>
+  <p id="authDescription" class="in text-sm text-white/50 mb-6">Sign in to reach your workspace. Your API keys stay yours.</p>
+
+  <form id="signInForm" class="in" novalidate>
+    <div class="f" id="fe">
+      <input id="signInEmail" type="email" placeholder=" " autocomplete="email" required data-m>
+      <label for="signInEmail">Email address</label>
+      <i class="hr"></i>
+    </div>
+    <div class="f pw" id="fp">
+      <input id="signInPassword" type="password" placeholder=" " autocomplete="current-password" required data-m>
+      <label for="signInPassword">Password</label>
+      <button type="button" id="eye" data-m aria-label="Show password">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/><path class="sl" d="M4 4l16 16"/></svg>
+      </button>
+      <i class="hr"></i>
+    </div>
+    <input id="rememberMe" type="checkbox" checked hidden>
+    <div class="flex justify-end -mt-1 mb-4 mono">
+      <a href="#" id="forgotPassword" class="lk" data-m>Forgot password?</a>
+    </div>
+    <button id="go" class="btn" type="submit" data-m>
+      <span class="shine"></span><span class="lab">Enter Workspace</span>
+      <svg class="spin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="rgba(14,19,17,.22)" stroke-width="2"/><g class="orb"><circle cx="12" cy="3" r="2.4" fill="#0E1311"/></g></svg>
+    </button>
+  </form>
+
+  <form id="createAccountForm" class="in hidden" novalidate>
+    <div class="f">
+      <input id="createEmail" type="email" placeholder=" " autocomplete="email" required data-m>
+      <label for="createEmail">Email address</label><i class="hr"></i>
+    </div>
+    <div class="f">
+      <input id="createPassword" type="password" placeholder=" " autocomplete="new-password" required data-m>
+      <label for="createPassword">Create password</label><i class="hr"></i>
+    </div>
+    <button id="createAccount" class="btn" type="submit" data-m>
+      <span class="shine"></span><span class="lab">Create Workspace</span>
+    </button>
+  </form>
+
+  <div class="div mono in"><i></i><span>OR CONTINUE WITH</span><i></i></div>
+  <div class="grid grid-cols-2 gap-3 in">
+    <button id="githubSignIn" type="button" class="oa" data-p="GitHub" data-m>
+      <svg viewBox="0 0 24 24" fill="#F3F6F4"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0 1 12 6.844a9.59 9.59 0 0 1 2.504.337c1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.02 10.02 0 0 0 22 12.017C22 6.484 17.522 2 12 2Z"/></svg>GitHub
+    </button>
+    <button id="googleSignIn" type="button" class="oa" data-p="Google" data-m>
+      <svg viewBox="0 0 24 24"><path fill="#4285F4" d="M23.745 12.27c0-.79-.07-1.54-.19-2.27h-11.3v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82Z"/><path fill="#34A853" d="M12.255 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96h-3.98v3.09C3.515 21.3 7.565 24 12.255 24Z"/><path fill="#FBBC05" d="M5.525 14.29c-.25-.72-.38-1.49-.38-2.29s.14-1.57.38-2.29V6.62h-3.98a11.86 11.86 0 0 0 0 10.76l3.98-3.09Z"/><path fill="#EA4335" d="M12.255 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C18.205 1.19 15.495 0 12.255 0c-4.69 0-8.74 2.7-10.71 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96Z"/></svg>Google
+    </button>
+  </div>
+
+  <p id="authMessage" class="mono in text-center text-white/40 mt-5 min-h-[16px]" role="status" aria-live="polite"></p>
+  <p id="switchPrompt" class="mono in text-center text-white/40 mt-3">
+    New to orbit? <a href="#" id="switchAuthMode" class="lk" data-m>Create a workspace</a>
+  </p>
+</div>
+  </div>
+</main>
+
+<footer class="fixed bottom-0 inset-x-0 z-20 flex justify-between items-end gap-2 px-5 sm:px-8 pointer-events-none mono" style="padding-bottom:calc(env(safe-area-inset-bottom,0px) + 16px)">
+  <div class="flex flex-wrap gap-2">
+    <span class="pill" data-m data-a="API // 3 PROVIDERS LINKED" data-o="API // BYOK READY"><b></b><span>API // BYOK READY</span></span>
+    <span class="pill" data-m data-a="LATENCY // P95 18ms" data-o=""><b></b><span id="lat">LATENCY // 12ms</span></span>
+  </div>
+  <span class="pill hidden sm:inline-flex" data-m data-a="STORAGE // ON-DEVICE ONLY" data-o="LOCAL // ENCRYPTED"><span>LOCAL // ENCRYPTED</span></span>
+</footer></section>
+
+<script>
+(()=>{
+const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const fine=matchMedia('(hover:hover) and (pointer:fine)').matches;
+const cv=$('#bg'),c=cv.getContext('2d');let W=0,H=0,D=1;
+const M={x:innerWidth/2,y:innerHeight/2,gx:innerWidth/2,gy:innerHeight/2,hx:innerWidth/2,hy:innerHeight/2,nx:0,ny:0};
+const stars=[],rip=[],R={p:0},ORB=[.14,.22,.31,.42,.54,.68,.84];
+function size(){D=Math.min(devicePixelRatio||1,2);W=innerWidth;H=innerHeight;cv.width=W*D;cv.height=H*D;c.setTransform(D,0,0,D,0,0)}
+size();addEventListener('resize',size);
+for(let i=0;i<170;i++)stars.push({x:Math.random(),y:Math.random(),z:.2+Math.random()*.8,r:Math.random()*1.3+.3,p:Math.random()*6.28,g:Math.random()<.12});
+
+/* floating workshop objects */
+const defs=[
+ `<span class="s">$</span> spaceline sync --local`,
+ `<span class="k">agent</span>.run(<span class="s">“inbox → brief”</span>)`,
+ `{ <span class="k">"key"</span>: <span class="s">"sk-••••3f9a"</span>, <span class="k">"byok"</span>: true }`,
+ `<div class="t">roadmap.md</div><div class="ln" style="width:130px"></div><div class="ln" style="width:90px"></div><div class="ln" style="width:110px"></div>`,
+ `<div><span class="s">☑</span> Draft spec</div><div>☐ Review PR #218</div><div>☐ Ship orbit v1</div>`,
+ `<svg width="96" height="52" viewBox="0 0 96 52" fill="none" stroke="rgba(143,227,90,.6)"><path d="M12 40L40 12L84 30M40 12L50 44"/><circle cx="12" cy="40" r="4" fill="#8FE35A"/><circle cx="40" cy="12" r="4" fill="#D7B84A"/><circle cx="84" cy="30" r="4" fill="#8FE35A"/><circle cx="50" cy="44" r="4" fill="#F3F6F4"/></svg>`,
+ `“Refactor the auth flow and keep it local-first”`,
+ `ctx 62%<div class="bar"><i style="width:62%"></i></div>`,
+ `git commit -m <span class="s">“orbit: lock grid”</span>`,
+ `<span class="s">●</span> claude · gpt · local-llm`
+];
+const small=innerWidth<760;
+const items=defs.slice(0,small?4:defs.length).map((h,i)=>{
+ const el=document.createElement('div');el.className='fl'+(i==6?' wrap':'');el.innerHTML=h;$('#float').appendChild(el);
+ const d=.45+Math.random()*.55;el.dataset.o=(.35+d*.55).toFixed(2);el.style.filter=d<.6?'blur(1.2px)':'none';
+ return{el,a:.18+Math.random()*.3,b:.16+Math.random()*.26,sp:(.05+Math.random()*.07)*(i%2?-1:1),ph:i*2.1,d,ox:0,oy:0,vx:0,vy:0,px:0,py:0,r:(Math.random()-.5)*10};
+});
+function boom(x,y,s=1){
+ rip.push({x,y,t:0,s});
+ items.forEach(it=>{const dx=it.px-x,dy=it.py-y,d=Math.hypot(dx,dy)||1;if(d<520){const f=(1-d/520)*700*s;it.vx+=dx/d*f;it.vy+=dy/d*f}});
+}
+
+/* cursor */
+const cr=$('#cr'),cd=$('#cd');let hov=null,S={x:-99,y:-99,w:30,h:30};
+addEventListener('pointermove',e=>{
+ M.x=e.clientX;M.y=e.clientY;cd.style.transform=`translate(${M.x}px,${M.y}px)`;
+ $('#xy').textContent=`X ${(M.x-W/2>=0?'+':'-')+String(Math.abs(Math.round(M.x-W/2))).padStart(3,'0')} / Y ${(H/2-M.y>=0?'+':'-')+String(Math.abs(Math.round(H/2-M.y))).padStart(3,'0')}`;
+ const h=e.target.closest&&e.target.closest('[data-m]');
+ if(h!==hov){hov=h;cr.classList.toggle('on',!!h);cr.style.borderRadius=h?(h.dataset.m==='circle'?'999px':getComputedStyle(h).borderRadius||'12px'):'999px'}
+ const r=$('#card').getBoundingClientRect();$('#card').style.setProperty('--mx',(e.clientX-r.left)+'px');$('#card').style.setProperty('--my',(e.clientY-r.top)+'px');
+ gsap.to('#tilt',{rotationY:((M.x/W)-.5)*9,rotationX:-((M.y/H)-.5)*7,duration:.7,ease:'power2.out'});
+ /* logo magnet */
+ const lg=$('#logo'),b=lg.getBoundingClientRect(),cx=b.left+b.width/2-gsap.getProperty(lg,'x'),cy=b.top+b.height/2-gsap.getProperty(lg,'y');
+ const dd=Math.hypot(M.x-cx,M.y-cy),k=dd<220?(1-dd/220)*.28:0;
+ gsap.to(lg,{x:(M.x-cx)*k,y:(M.y-cy)*k,duration:.5,ease:'power3.out'});
+ if(hov&&hov.id==='go'){const g=hov.getBoundingClientRect();gsap.to(hov,{x:(e.clientX-g.left-g.width/2)*.08,y:(e.clientY-g.top-g.height/2)*.18,duration:.3})}
+ const o=e.target.closest&&e.target.closest('.oa');if(o){const g=o.getBoundingClientRect();o.style.setProperty('--mx',(e.clientX-g.left)+'px');o.style.setProperty('--my',(e.clientY-g.top)+'px')}
+});
+$('#go').addEventListener('pointerleave',e=>gsap.to(e.currentTarget,{x:0,y:0,duration:.6,ease:'elastic.out(1,.4)'}));
+$('#tilt').addEventListener('pointerleave',()=>gsap.to('#tilt',{rotationX:0,rotationY:0,duration:.8}));
+addEventListener('pointerdown',e=>{boom(e.clientX,e.clientY,1)});
+$$('.btn,.oa').forEach(b=>{b.addEventListener('pointerdown',()=>gsap.to(b,{scale:.97,duration:.12}));['pointerup','pointerleave'].forEach(ev=>b.addEventListener(ev,()=>gsap.to(b,{scale:1,duration:.5,ease:'elastic.out(1,.5)'})))});
+/* logo hover split */
+$('#logo').addEventListener('pointerenter',()=>{gsap.to('.pl-top',{y:-4,duration:.4});gsap.to('.pl-bot',{y:4,duration:.4})});
+$('#logo').addEventListener('pointerleave',()=>{gsap.to('.pl-top,.pl-bot',{y:0,duration:.6,ease:'elastic.out(1,.5)'})});
+/* pills */
+$$('.pill[data-a]').forEach(p=>{const s=p.querySelector('span');p.addEventListener('pointerenter',()=>{p.dataset.o=p.dataset.o||s.textContent;s.textContent=p.dataset.a});p.addEventListener('pointerleave',()=>{if(p.dataset.o)s.textContent=p.dataset.o})});
+setInterval(()=>{const v=9+Math.floor(Math.random()*8),s=$('#lat');if(s.textContent.indexOf('P95')<0)s.textContent=`LATENCY // ${v}ms`;$('#clk').textContent=new Date().toISOString().slice(11,19)+' UTC'},1200);
+
+/* wordmark split */
+$('#word').innerHTML=[...'SPACELINE'].map(ch=>`<span class="wl" style="display:inline-block">${ch}</span>`).join('');
+
+/* render loop */
+let last=performance.now();
+function frame(t){
+ const dt=Math.min((t-last)/1000,.05);last=t;
+ M.gx+=(M.x-M.gx)*.13;M.gy+=(M.y-M.gy)*.13;M.hx+=(M.x-M.hx)*.04;M.hy+=(M.y-M.hy)*.04;
+ M.nx=(M.gx/W-.5)*2;M.ny=(M.gy/H-.5)*2;
+ const g=c.createRadialGradient(W/2,H*.45,0,W/2,H*.45,Math.max(W,H)*.8);g.addColorStop(0,'#18221E');g.addColorStop(1,'#0E1311');c.fillStyle=g;c.fillRect(0,0,W,H);
+ let q=c.createRadialGradient(M.hx,M.hy,0,M.hx,M.hy,260);q.addColorStop(0,'rgba(215,184,74,.07)');q.addColorStop(1,'transparent');c.fillStyle=q;c.fillRect(0,0,W,H);
+ q=c.createRadialGradient(M.gx,M.gy,0,M.gx,M.gy,360);q.addColorStop(0,'rgba(143,227,90,.15)');q.addColorStop(1,'transparent');c.fillStyle=q;c.fillRect(0,0,W,H);
+ for(let i=rip.length-1;i>=0;i--){rip[i].t+=dt;if(rip[i].t>1.6)rip.splice(i,1)}
+ /* orbits */
+ const cx=W/2-M.nx*14,cy=H*.5-M.ny*10,rot=-.32,cr_=Math.cos(rot),sr=Math.sin(rot),big=Math.max(W,H)*1.05;
+ ORB.forEach((o,i)=>{
+  const p=Math.max(0,Math.min(1,R.p*ORB.length-i)),rx=o*big,ry=rx*.34;if(p<=0)return;
+  c.strokeStyle=`rgba(243,246,244,${.05+(i==3?.04:0)})`;c.lineWidth=1;c.beginPath();c.ellipse(cx,cy,rx,ry,rot,0,Math.PI*2*p);c.stroke();
+  if(p>=1){const a=t*.0001*(1.4-i*.14)*(i%2?-1:1)+i*1.7,ex=rx*Math.cos(a),ey=ry*Math.sin(a),x=cx+ex*cr_-ey*sr,y=cy+ex*sr+ey*cr_;
+   c.fillStyle=i%3==0?'#D7B84A':'#8FE35A';c.shadowColor=c.fillStyle;c.shadowBlur=10;c.beginPath();c.arc(x,y,i%3==0?2.6:2,0,7);c.fill();c.shadowBlur=0}
+ });
+ /* stars */
+ stars.forEach(s=>{
+  s.x+=dt*.0015*s.z;if(s.x>1.02)s.x=-.02;
+  let x=s.x*W-M.nx*30*s.z,y=s.y*H-M.ny*22*s.z;
+  const dx=M.gx-x,dy=M.gy-y,d=Math.hypot(dx,dy);if(d<200&&d>1){const f=(1-d/200)*14*s.z;x+=dx/d*f;y+=dy/d*f}
+  rip.forEach(r=>{const rr=r.t*720,dx=x-r.x,dy=y-r.y,dd=Math.hypot(dx,dy)||1,band=Math.abs(dd-rr);if(band<80){const f=(1-band/80)*(1-r.t/1.6)*26*r.s;x+=dx/dd*f;y+=dy/dd*f}});
+  const tw=.35+.5*Math.sin(t*.002+s.p);c.fillStyle=s.g?`rgba(215,184,74,${tw*s.z})`:`rgba(243,246,244,${tw*s.z*.8})`;c.beginPath();c.arc(x,y,s.r*s.z,0,7);c.fill();
+ });
+ rip.forEach(r=>{const a=1-r.t/1.6;c.strokeStyle=`rgba(143,227,90,${a*.5*Math.min(r.s,1.2)})`;c.lineWidth=1.5;c.beginPath();c.arc(r.x,r.y,r.t*720,0,7);c.stroke();c.strokeStyle=`rgba(215,184,74,${a*.25})`;c.beginPath();c.arc(r.x,r.y,r.t*720*.82,0,7);c.stroke()});
+ /* floating items */
+ items.forEach(it=>{
+  const a=t*.001*it.sp+it.ph;it.px=W/2+Math.cos(a)*it.a*W-M.nx*40*it.d;it.py=H/2+Math.sin(a)*it.b*H-M.ny*30*it.d;
+  const dx=it.px+it.ox-M.gx,dy=it.py+it.oy-M.gy,d=Math.hypot(dx,dy)||1;
+  if(d<190){const f=(1-d/190)*1500*dt;it.vx+=dx/d*f;it.vy+=dy/d*f}
+  it.vx+=-it.ox*30*dt;it.vy+=-it.oy*30*dt;const dm=Math.pow(.04,dt);it.vx*=dm;it.vy*=dm;it.ox+=it.vx*dt;it.oy+=it.vy*dt;
+  it.el.style.transform=`translate3d(${it.px+it.ox}px,${it.py+it.oy}px,0) translate(-50%,-50%) rotate(${it.r+it.vx*.02}deg) scale(${.75+it.d*.35})`;
+ });
+ /* cursor ring */
+ if(fine){let tx=M.x,ty=M.y,tw=30,th=30;
+  if(hov){const b=hov.getBoundingClientRect(),bx=b.left+b.width/2,by=b.top+b.height/2;
+   if(hov.dataset.m==='circle'){tw=th=Math.max(b.width,b.height)+8}else{tw=b.width+12;th=b.height+12}
+   tx=bx+(M.x-bx)*.12;ty=by+(M.y-by)*.12}
+  S.x+=(tx-S.x)*.22;S.y+=(ty-S.y)*.22;S.w+=(tw-S.w)*.22;S.h+=(th-S.h)*.22;
+  cr.style.width=S.w+'px';cr.style.height=S.h+'px';cr.style.transform=`translate(${S.x-S.w/2}px,${S.y-S.h/2}px)`}
+ requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* entrance choreography */
+gsap.set('#tilt',{transformPerspective:1100});
+const tl=gsap.timeline({defaults:{ease:'power3.out'}});
+tl.to(R,{p:1,duration:2.2,ease:'power2.inOut'},0)
+ .from('#logo',{opacity:0,scale:.7,duration:1},.7)
+ .from('.pl-top',{y:-22,opacity:0,duration:.9},.8)
+ .from('.pl-bot',{y:22,opacity:0,duration:.9},.8)
+ .from('.pl-mid',{opacity:0,scaleX:.4,transformOrigin:'50% 50%',duration:.9},.95)
+ .from('.wl',{y:28,opacity:0,filter:'blur(8px)',stagger:.045,duration:.8},1.1)
+ .from('#tag',{opacity:0,y:10,duration:.8},1.45)
+ .from('#card',{opacity:0,y:44,scale:.96,duration:1.1},1.35)
+ .from('.in',{opacity:0,y:16,stagger:.07,duration:.7},1.7)
+ .to('.fl',{opacity:(i,el)=>el.dataset.o,duration:1.6,stagger:.12,ease:'power1.out'},1.2)
+ .from('header>*,footer>*,footer .pill',{opacity:0,y:10,stagger:.08,duration:.7},2);
+})();
+</script>
+
+<div id="app" class="app-shell" hidden>
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-topline">
+        <div class="brand-lockup" aria-label="Spaceline"><img class="brand-mark" src="/assets/spaceline-mark.svg" alt=""><div class="brand-copy"><strong>SPACELINE</strong><span>INTELLIGENCE WORKSPACE</span></div></div>
+        <div class="sidebar-top-actions"><button class="icon-button" id="sidebarToggle" title="Collapse sidebar" aria-label="Toggle sidebar">☰</button></div>
+      </div>
+      <div class="mode-switch" role="tablist" aria-label="Workspace mode">
+        <button class="mode active" data-mode="cowork">✣ <span>Cowork</span></button>
+        <button class="mode" data-mode="code">‹› <span>Code</span></button>
+      </div>
+      <nav class="primary-nav" aria-label="Main navigation">
+        <button class="nav-item" data-view="chat"><span class="nav-icon">＋</span><span>New</span></button>
+        <button class="nav-item" data-view="search"><span class="nav-icon">⌕</span><span>Search</span></button>
+        <button class="nav-item" data-view="projects"><span class="nav-icon">▱</span><span>Projects</span></button>
+        <button class="nav-item" data-view="artifacts"><span class="nav-icon">▣</span><span>Artifacts</span></button>
+        <button class="nav-item image-studio-nav" data-view="images"><span class="nav-icon">✧</span><span>Image Studio</span></button>
+        <button class="nav-item" data-view="scheduled"><span class="nav-icon">◷</span><span>Scheduled</span></button>
+        <button class="nav-item" data-view="customize"><span class="nav-icon">♧</span><span>Customize</span></button>
+      </nav>
+      <div class="sidebar-section-head"><span>Tasks</span><button class="icon-button small" id="refreshChats" title="Refresh chats">☷</button></div>
+      <div class="task-list" id="taskList"><div class="quiet-note">Your recent chats will appear here.</div></div>
+      <button class="view-all" id="viewAllChats">View all</button>
+      <div class="sidebar-footer">
+        <button id="accountMenuButton" class="account-menu-button" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Account menu">
+          <span class="user-avatar" id="accountAvatar">N</span>
+          <span class="user-info"><strong id="accountName">Spaceline account</strong><span id="serverStatus">Connecting…</span></span>
+        </button>
+        <div id="accountMenu" class="account-menu hidden" role="menu">
+          <div class="account-menu-profile"><strong id="accountMenuName">Spaceline account</strong><span id="accountEmail"></span></div>
+          <button id="switchAccount" type="button" role="menuitem">Switch account</button>
+          <button id="signOut" type="button" role="menuitem">Sign out</button>
+        </div>
+        <button class="icon-button small" id="footerSettings" title="Provider settings">⌄</button>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <div class="breadcrumb" id="breadcrumb"><span class="crumb-muted">Workspace</span><span class="crumb-sep">/</span><strong id="viewTitle">New chat</strong></div>
+        <div class="topbar-actions">
+          <button class="quiet-button preview-launcher" id="openLivePreview" type="button" title="Open the live project preview">◫ Preview</button>
+          <button class="image-studio-launcher" id="openImageStudio" type="button" title="Open standalone image generation studio"><span class="image-studio-launcher-icon">✧</span><span>Image Studio</span></button>
+          <button class="quiet-button" id="quickProvider">No model selected</button>
+          <button class="icon-button command-palette-trigger" id="openCommandPalette" type="button" title="Command palette · Ctrl+K" aria-label="Open command palette">⌘</button>
+          <button class="icon-button" id="openCustomize" title="Customize" aria-label="Customize">⚙</button>
+        </div>
+      </header>
+      <section id="viewRoot" class="view-root"></section>
+    </main>
+  </div>
+<script>
+document.addEventListener("DOMContentLoaded",function(){
+ const eye=document.getElementById("eye"),pw=document.getElementById("signInPassword");
+ if(eye&&pw)eye.addEventListener("click",function(){
+  const show=pw.type==="password";pw.type=show?"text":"password";
+  eye.classList.toggle("on",show);
+  eye.setAttribute("aria-label",show?"Hide password":"Show password");
+ });
+});
+</script>
+<script>
+    window.SPACELINE_TOKEN = "__SPACELINE_TOKEN__";
+    window.SPACELINE_FIREBASE_CONFIG = __FIREBASE_CONFIG__;
+    window.SPACELINE_FIREBASE_CONFIGURED = __FIREBASE_CONFIGURED__;
+    window.SPACELINE_FIREBASE_MISSING = __FIREBASE_MISSING__;
+    window.SPACELINE_FIREBASE_BACKEND_READY = __FIREBASE_BACKEND_READY__;
+  </script>
+<script type="module" src="/assets/auth.js?v=0.9.6"></script>
+</body>
+</html>
+

@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Spaceline (local server)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["app.main:app", "--host", "127.0.0.1", "--port", "8765"],
+      "justMyCode": true,
+      "env": { "SPACELINE_WORKSPACE_DIR": "${env:USERPROFILE}\\Documents\\Spaceline" }
+    }
+  ]
+}

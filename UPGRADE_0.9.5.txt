@@ -1,0 +1,31 @@
+SPACELINE WORKSPACE 0.9.5 — UPGRADE NOTES
+
+RESEARCH ROUTING
+- Web Search and Deep Research now use direct HTTP retrieval; they do not start embedded Chromium.
+- Web Search seeds two independent queries. Deep Research seeds three distinct research angles concurrently, then the selected model can call web_search and web_open_source for follow-up work.
+- Public-only HTTP/HTTPS destinations are allowed. Local/private hosts, unsafe redirects, non-HTML/non-text files, and oversized responses are rejected.
+- Research evidence is bounded and explicitly treated as untrusted page content. The model must not follow instructions embedded in sources or fabricate citations.
+- Chromium remains available in the Browser workbench for explicit interactive requests. “Do not open the browser” keeps the request in chat research.
+- The model is still the provider/model selected by the user. Spaceline does not make a weaker configured model reason like GPT-6, and does not silently change models.
+
+MESSAGE COPY
+- One icon-only note button appears below each completed assistant reply.
+- It copies the complete original Markdown, including prompts, explanations, headings, and code blocks.
+- Legacy Copy / Copy markdown / Copy all / Copy raw code / Copy code actions are removed from replies, including stale controls inserted after render.
+- Terminal output retains its separate copy control.
+
+STARTUP / CACHE
+- Launcher scans ports 8765–8799 and opens the actual port chosen for the new process.
+- CSS and JavaScript use 0.9.5 cache-busting query strings; the home HTML response is not cached.
+
+INSTALL
+1. Stop any old Spaceline terminal with Ctrl+C.
+2. Extract this ZIP into a new folder (recommended), rather than extracting over a running instance.
+3. Run start.bat from the extracted folder.
+4. Use the exact local URL printed in the terminal. If an old instance still uses 8765, Spaceline selects the next available port.
+5. Existing local workspace data remains in Documents\Spaceline unless SPACELINE_WORKSPACE_DIR was changed.
+
+VERIFICATION LIMITS
+- Automated tests: see TEST_REPORT_0.9.5.md.
+- Live external web search was not validated in the build environment because outbound DNS resolution is restricted. Test it on a Windows network with internet access.
+- No configured user API key/provider call or Windows GUI test was performed here.

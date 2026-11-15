@@ -1,0 +1,91 @@
+SPACELINE WORKSPACE 0.9.5 — QUICK START (WINDOWS)
+
+1. Extract this ZIP to a permanent folder, for example:
+   C:\Users\YOUR_NAME\Desktop\Spaceline
+2. Open that folder in VS Code.
+3. Open the VS Code terminal and run:
+   .\start.bat
+4. First launch creates .venv and installs the required Python packages.
+5. The launcher checks for Playwright Chromium and downloads it automatically if missing.
+   Chromium is used for the explicit Browser workbench; Web Search and Deep Research use direct HTTP retrieval and do not open Chromium.
+   If the Chromium download fails, the launcher prints a manual recovery command and still starts Spaceline.
+6. The launcher chooses an available local port from 8765–8799, prints the exact URL, and opens that URL in your browser.
+7. Keep the VS Code terminal open while using Spaceline. Press Ctrl+C to stop it.
+
+CONNECT YOUR API
+1. Open Customize > Personalization to set your response tone, detail, layout, problem-solving style and custom instructions. These preferences are saved locally and applied to future requests; they do not fine-tune model weights or change provider/model selection.
+
+Open Customize > Providers & keys.
+2. Choose Add API key. Enter a label such as FreeLLM, a key name, and the API secret.
+3. Choose Add connection. The Provider selector includes OpenAI, NVIDIA NIM,
+   Groq, OpenRouter, DeepSeek, Kimi / Moonshot, Together AI, Fireworks,
+   Cerebras, Mistral, SambaNova, xAI / Grok, Perplexity, DeepInfra, Qwen,
+   Hugging Face, Novita, Cohere, Anthropic, Gemini, FreeLLM, Ollama,
+   LM Studio, vLLM, LocalAI, llama.cpp, and a custom endpoint.
+4. Choosing a preset fills its common API base URL. The URL remains editable.
+   FreeLLM is preconfigured for the local gateway previously used:
+   http://127.0.0.1:31415/v1
+5. Choose one or more saved keys, enter a model ID (or leave it until you open
+   Models ↻), and save. Add as many keys and named connections as needed.
+   OpenAI-compatible gateways can choose Bearer, X-API-Key, API-Key, or No
+   authentication. Native Anthropic/Gemini/Ollama auth stays automatic.
+6. In chat, select a provider and click **Models ↻**. Spaceline fetches the live model catalogue and opens a searchable selector. Click **Refresh models** inside it to fetch again, choose a result, then click **Use selected model**. You can enter an exact model ID manually if the endpoint does not list models. Pagination is followed when the provider exposes cursor/page-token metadata (up to 50 pages). The list is every model the selected endpoint/key exposes, not a global catalogue of every model offered by that vendor.
+7. Add multiple keys to one connection only when you want same-provider credential retry for the exact same model. Spaceline never uses keys that are not assigned to that connection. Use **Test connection** beside an individual key, or **Test all saved keys** in the API key vault to check every saved key sequentially without revealing any key values. These checks contact provider model-list endpoints; they verify authentication/catalog access, not generation entitlement, billing or quota.
+8. You can save and enable several provider connections, but Spaceline sends a chat only to the exact connection and model currently selected in the composer. It never rotates a chat to another provider or model. If the selected connection fails, Spaceline shows the error and stops. Multiple keys explicitly attached to that same connection may be retried only within that same provider/model route; a different connection or model always requires your approval.
+9. The model picker uses the authenticated model-list endpoint exposed by each provider. OpenRouter shows pricing labels and a **Free variants only** filter for `:free` routes. A listed model ID is not proof of account access, billing eligibility or quota.
+10. In Customize → Providers & keys, use **Test all models** below a connection to test every model ID returned by that provider. Spaceline sends a minimal generation probe, shows progress and keeps only confirmed working IDs. It distinguishes invalid/missing keys, account access, billing, quota, missing model IDs and temporary provider outages; quota/outage failures do not prove a model is unsupported. This may use quota or incur charges. With multiple saved keys, Spaceline may try another key after an authorization/permission denial. In the model picker, use **Test access** for a listed ID or enter an exact unlisted ID and click **Test ID**; that ID becomes selectable only after it passes.
+11. Gemini 4 Argon (`gemini-4-argon`) is explicitly unavailable on Google's free Gemini API tier. It requires a Paid Tier Google AI Studio project with API billing. A Gemini app subscription is separate and does not unlock Gemini API billing. Review Google's current pricing before enabling it: https://ai.google.dev/gemini-api/docs/pricing
+
+WORK MODES + LIVE WORKSPACE
+- Chat: direct conversation with the selected model.
+- Web Search: automatically runs a first live search in Spaceline’s private headless Chromium session, passes the evidence to your selected model, then allows up to 8 tool rounds for source inspection and citations.
+- Deep Think: structured problem-solving (decomposition, assumptions, trade-offs and verification); browser research is used only when the task needs current external evidence.
+- Deep Research: automatically runs a first live search, then gives your selected model up to 14 tool rounds to search, open/read sources, compare evidence and synthesize a report. Its quality and ability to use tools depend on the selected model’s function-calling support.
+- The right-side workbench has Browser, Preview, Code, Files, Review, Images and Activity tabs. Web Search and Deep Research keep the private Chromium research session in the background and show progress in Activity; use the Browser tab only when you explicitly want to inspect or control the browser. In Code, HTML files open beside a live preview; edits auto-save after you pause typing, and Ctrl+S also saves. Use the top-bar Preview shortcut for a direct preview view. A **↗ Browser** shortcut in the chat toolbar reveals the right-side Browser panel.
+- Browse design references and components from the Browser tab: shadcn/ui, Motion, React Bits, Aceternity, Magic UI, Vercel templates, Tailwind, Awwwards and prompt guides.
+- The selected provider/model does not change when you switch a task mode. Function-calling support is required for automatic tool actions.
+- **Image Studio:** use the dedicated sidebar entry or top-bar **Image Studio** button to open a standalone creation workspace, independent of chat. Generate through an enabled OpenAI, Gemini, Eden AI or free AI Horde connection. OpenAI offers GPT Image 2.5/2.6 Flare and Sunburst; Gemini offers Gemini 3.1 Flash Image, Flash Lite Image (1K only), and Gemini 3 Pro Image. Eden AI loads the image models available to your key and region from its live V3 catalog; select the exact returned `provider/model` ID. Choose a supported aspect ratio; Eden AI uses the selected model provider’s default quality unless its API explicitly exposes a compatible setting. Image history and prompt metadata persist locally in `Generated Images`; refresh, save, and delete items from the gallery. OpenAI, Gemini and Eden AI can consume provider credits or quota. AI Horde is community-powered and free; leave its optional key blank for anonymous access, or register at https://aihorde.net/register for a free key with better queue priority. Anonymous jobs have the lowest priority and can take longer.
+- Use ＋ beside the composer for task modes, document/source attachments, browser, UI/motion references, code, preview, project files, skills, integration status and providers.
+- Four direct mode buttons (Chat, Web Search, Deep Think, Deep Research) are also visible in the composer; selecting one immediately updates the active task mode.
+- While the selected model is processing a request, a compact cyan/amber HUD appears under the Spaceline assistant label. It disappears when the response completes or errors.
+- Message attachments support PDF, DOCX, XLSX, PPTX, CSV/TSV and common text/code files. Up to 3 files (20 MB each); extracted content is capped at 15,000 combined characters per message and is sent to the selected provider. Never attach API keys or secrets.
+
+DATA AND SECURITY
+- Delete a conversation from the recent-chat list, Search results, or its open-chat toolbar. Deletion permanently removes the conversation and its messages after confirmation.
+- Remote provider endpoints must use HTTPS; only local loopback endpoints (localhost/127.0.0.1/::1) may use HTTP.
+- Projects, conversations, settings, and saved artifacts live in:
+  %USERPROFILE%\Documents\Spaceline
+- API secrets are stored in Windows Credential Manager.
+- The app binds to 127.0.0.1 only. Do not expose the port to the internet.
+- Selecting a project for chat sends up to eight small source-file excerpts to the selected provider. Review your project for secrets first.
+- The developer terminal is not sandboxed and can run allowed commands with your Windows user permissions. AI project checks use a narrower command allowlist; neither should be treated as a security sandbox.
+
+FILE READING + SKILLS
+- Select a project PDF/DOCX/XLSX/PPTX/CSV/TSV or text file in the Files panel to preview extracted text. Choose **Ask AI about this file** to send the bounded extraction into chat. You can also attach a document directly with ＋.
+- Scanned/image-only PDFs or slides need OCR/vision and may return no selectable text. Spreadsheet formulas are not recalculated; cached values are shown only when stored in the file.
+- Spaceline includes 28 built-in skills for coding, review, security, APIs, tests, DevOps, data/spreadsheets, documents, presentations, visualization, browser research, accessibility, UX, planning, writing, math, Python and interview coaching. You can import more Claude-compatible SKILL.md packs.
+
+SPACELINE BROWSER + SKILLS
+- Open the Browser tab in the right-hand workbench (or click **↗ Browser** beside the chat toolbar) and enter a URL or search phrase. Spaceline loads it in its own persistent Playwright Chromium profile and shows its screenshot/readable text inside the workspace. It does not launch a separate Chrome window or share your regular Chrome cookies.
+- Use the right-side **Browser controls** command bar: `open https://example.com`, `search for a topic`, `click on Pricing`, `type a query into Search`, `select United States in Country`, `check Remember me`, `uncheck Remember me`, `hover over Products`, `scroll down 2 pages`, `go back`, `go forward`, or `read this page`. It controls ordinary visible links, buttons, tabs/menu items, text inputs, select menus and checkboxes.
+- For safety, Spaceline does not fill passwords/API keys/tokens/payment data, submit forms, make purchases, send messages, or activate destructive/account actions. Use a normal browser for sign-in and sensitive transactions. The browser is separate from everyday Chrome and does not reuse its cookies.
+- `start.bat` now checks for the Chromium browser engine and installs it automatically when missing. If network restrictions block the download, run `.venv\Scripts\python.exe -m playwright install chromium` in the Spaceline folder, then restart.
+- Open Customize > Skills to see built-in packs or import Claude-compatible SKILL.md files. Matching skills are activated automatically for relevant requests.
+- In Code mode, select a project and ask the model to inspect/edit files or run supported test/build checks. Choose Review mode to see read-only tracked Git status and unstaged diff; untracked files and staged changes are not included in this release. Tool support depends on the selected model.
+
+401 TROUBLESHOOTING
+- Make sure you selected the key from the same provider as the connection, not a key from another service.
+- Check that the endpoint and key belong together. FreeLLM at http://127.0.0.1:31415/v1 may expect the gateway's own token if authentication is enabled. Edit the connection and select the auth header configured by the gateway (Bearer is the default; X-API-Key/API-Key are alternatives).
+- Add a backup key to the same connection; Spaceline will retry another saved key after an authentication failure. A revoked or invalid key must still be replaced at the provider.
+
+TEST (DEVELOPER CHECK)
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+
+See README.md for supported providers, detailed setup, and current feature limits.
+
+WORKSPACE SHORTCUTS
+- Ctrl+K: open the searchable command palette. Use arrow keys to select and Enter to run.
+- Ctrl+Shift+F: search conversations.
+- Shift+Enter: add a new line in the composer; Enter sends.
+- Your sidebar/workbench layout and unsent drafts are saved locally in this browser profile.

@@ -1,0 +1,40 @@
+SPACELINE WORKSPACE 0.9.0 — UPGRADE NOTES
+
+This is an upgrade to the existing Spaceline 0.8.9 project. It preserves the local FastAPI application, provider system, key vault, image studio, browser, project workspace, terminal, notes and existing workspace data location.
+
+WHAT CHANGED IN 0.9.0
+- Customize now includes Personalization. Set a preferred name, user context, tone, response length, format, problem-solving style, behavior preferences and custom instructions. Settings are stored locally and included in requests to the selected model.
+- Personalization changes response instructions; it does not fine-tune model weights or silently change the provider, endpoint, model or API key.
+- Deep Think requests structured problem solving: break down the task, identify assumptions and constraints, compare options, check edge cases and verify conclusions. It does not display hidden chain-of-thought and does not open the browser by default.
+- Web Search and Deep Research continue to use the embedded browser for source-backed research.
+- Added a Preview shortcut in the top bar and a Codex-style split Code + live HTML Preview in the workbench.
+- HTML files can be edited next to their preview. Changes auto-save after a pause; Save and Ctrl+S are available. The preview refreshes after a successful save. Preview navigation will not discard dirty edits if a save fails.
+- The workspace UI now uses black, white and neutral gray. User-generated web pages and image previews retain their own content colors.
+- Updated app/API version and Windows setup marker to 0.9.0.
+
+INSTALL / UPGRADE
+1. Keep the existing Spaceline folder as a backup.
+2. Extract this ZIP to a new folder, e.g. Downloads\Spaceline-0.9.0.
+3. Open the extracted Spaceline-0.9.0 folder in VS Code.
+4. Run .\start.bat from the terminal, or double-click start.bat.
+5. Keep the terminal open while using Spaceline. Spaceline opens at http://127.0.0.1:8765.
+6. Existing app data remains under %USERPROFILE%\Documents\Spaceline. Do not delete that folder during an upgrade.
+
+WINDOWS SECURITY
+- This is a source-based Python release, not a signed Windows installer or signed executable.
+- Keep Smart App Control enabled. Do not disable Windows security or bypass a blocked dependency.
+- If Smart App Control blocks a native module, capture the matching Code Integrity event and exact module name for compatibility diagnosis.
+
+PROVIDER / IMAGE NOTES
+- External provider behavior still depends on your saved API key, exact selected model, provider account entitlement, quota and network status.
+- Spaceline does not silently switch provider/model and does not send a second API request to an unrelated model as fallback.
+- Real provider chat/image generation must be tested with your own credentials. The automated test suite uses test doubles for external API boundaries.
+
+VERIFICATION
+- python -m pytest -q — 325 passed, 68 subtests passed.
+- python -m compileall -q app — passed.
+- node --check static/app.js — passed.
+- CSS parser — 1,068 top-level rules, zero parse errors.
+- Local app server and HTML/JS/CSS asset HTTP smoke checks — passed.
+- Graphical end-to-end browser verification was blocked in the build environment by Chromium's ERR_BLOCKED_BY_ADMINISTRATOR policy; it is not claimed as passed.
+- See TEST_REPORT_0.9.0.md and UPGRADE_REVIEW_14_ROLES_0.9.0.md for details and limitations.

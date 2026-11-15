@@ -1,0 +1,2558 @@
+(() => {
+  'use strict';
+  const $ = (selector, root = document) => root.querySelector(selector);
+  const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+  const state = {
+    view: 'chat', mode: 'cowork', activeChatId: null, activeChat: null,
+    chats: [], profiles: [], keys: [], providerPresets: [], activeProfileId: null,
+    projects: [], selectedProject: null, files: [], activeFile: null, activeDocument: null,
+    savedCodeContent: '', editorDirty: false, editorSaving: false, previewVersion: 1,
+    personalization: {name:'',about:'',tone:'direct',detail:'balanced',format:'adaptive',thinking_style:'balanced',challenge_assumptions:true,explain_steps:true,include_examples:true,ask_when_ambiguous:true,custom_instructions:''},
+    fileSearchResults: [], fileSearchQuery: '',
+    notes: [], skills: [], modelsByProfile: {}, browserPage: null,
+    customizeTab: 'providers', search: '', collapsed: false, codeContent: '',
+    taskMode: 'chat', workbenchTab: 'activity', workbenchCollapsed: true, sendInProgress: false, researchTaskActive: false,
+    liveAnswer: '', actualUsedModel: null,
+    browserData: null, browserScreenshotUrl: null, activities: [], attachments: [],
+    contextWindows: {}, generatedImages: [], imageGenerating: false, imageProfileId: null, imagePrompt: '', imageModelId: '', imageAspectRatio: '1:1', imageQuality: 'medium', imageModelsByProfile: {}, imageModelStatusByProfile: {}, imageModelErrorsByProfile: {}, keyTestResults: {}, bulkKeyTestRunning: false, bulkKeyTestProgress: null, modelCatalogByProfile: {},
+    bulkModelResults: {}, verifiedModelsByProfile: {}, browserCommandStatus: '', browserCommandBusy: false,
+    gitReview: null, gitReviewLoading: false, gitReviewError: '',
+    gitWorktrees: [], gitWorktreesProject: null, gitWorktreesLoading: false, gitWorktreesError: '',
+  };
+  const TOKEN = window.SPACELINE_TOKEN || '';
+  const MODEL_VERIFICATION_STORAGE_KEY = 'spaceline.verifiedModels.v1';
+  const MODEL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+  const WORKSPACE_PREFERENCES_KEY = 'spaceline.workspacePreferences.v1';
+  const CHAT_DRAFTS_KEY = 'spaceline.chatDrafts.v1';
+  const NOTE_COPY_ICON = '<svg class="copy-note-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="7" y="3.5" width="12" height="16" rx="2"/><path d="M5 7.5V18a2 2 0 0 0 2 2h9"/><path d="M10 8h6M10 11.5h6M10 15h4"/></svg>';
+  let toastTimer = null;
+  let pendingModelSwitchResolver = null;
+  let commandPaletteActiveIndex = 0;
+  let editorSaveTimer = null;
+  let editorSavePromise = null;
+
+  function escapeHTML(value) {
+    return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  }
+  function api(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    headers.set('X-Spaceline-Token', TOKEN);
+    if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+    return fetch(path, {...options, headers}).then(async response => {
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const error = new Error(data.detail || `Request failed (${response.status})`);
+        error.status = response.status;
+        error.sessionExpired = response.status === 403 && data.detail === 'This local workspace session is not authorized.';
+        throw error;
+      }
+      return data;
+    });
+  }
+  function toast(message) {
+    const el = $('#toast'); if (!el) return;
+    el.textContent = message; el.classList.add('show'); clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 2300);
+  }
+  function loadWorkspacePreferences() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(WORKSPACE_PREFERENCES_KEY) || '{}');
+      if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return;
+      state.collapsed = Boolean(saved.sidebarCollapsed);
+      state.workbenchCollapsed = saved.workbenchCollapsed !== false;
+      // Keep every supported workspace tab restorable, including Review.
+      const tabs = ['browser','preview','code','files','review','activity','images'];
+      if (tabs.includes(saved.workbenchTab)) state.workbenchTab = saved.workbenchTab;
+    } catch (_) { /* Invalid or unavailable local preferences are ignored safely. */ }
+  }
+  function saveWorkspacePreferences() {
+    try {
+      localStorage.setItem(WORKSPACE_PREFERENCES_KEY, JSON.stringify({
+        sidebarCollapsed: Boolean(state.collapsed),
+        workbenchCollapsed: Boolean(state.workbenchCollapsed),
+        workbenchTab: state.workbenchTab,
+        updatedAt: Date.now()
+      }));
+    } catch (_) { /* Private browsing/storage quota: current-session preferences still work. */ }
+  }
+  function currentDraftKey() {
+    return `${state.activeProfileId || 'no-profile'}:${state.activeChatId || 'new-chat'}`;
+  }
+  function loadComposerDraft() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(CHAT_DRAFTS_KEY) || '{}');
+      const record = saved[currentDraftKey()];
+      return typeof record?.value === 'string' ? record.value.slice(0, 12000) : '';
+    } catch (_) { return ''; }
+  }
+  function persistComposerDraft(value) {
+    try {
+      const drafts = JSON.parse(localStorage.getItem(CHAT_DRAFTS_KEY) || '{}');
+      const key = currentDraftKey();
+      const text = String(value || '').slice(0, 12000);
+      if (text.trim()) drafts[key] = {value:text, updatedAt:Date.now()};
+      else delete drafts[key];
+      const entries = Object.entries(drafts).sort((a,b)=>(b[1]?.updatedAt || 0)-(a[1]?.updatedAt || 0)).slice(0, 16);
+      localStorage.setItem(CHAT_DRAFTS_KEY, JSON.stringify(Object.fromEntries(entries)));
+    } catch (_) { /* Draft saving is best-effort and never blocks composing. */ }
+  }
+  let thinkingFrame = 0;
+  let thinkingCanvas = null;
+  const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches || false;
+
+  function stopThinkingHUD() {
+    if (thinkingFrame) cancelAnimationFrame(thinkingFrame);
+    thinkingFrame = 0;
+    thinkingCanvas = null;
+  }
+  function finishThinkingHUD() {
+    stopThinkingHUD();
+    $('#spacelineThinkingHUD')?.remove();
+  }
+  function setThinkingStatus(message) {
+    const label = $('#spacelineThinkingStatus');
+    if (label) label.textContent = String(message || 'Thinking…').replace(/\s+/g, ' ').trim().slice(0, 76);
+  }
+  function startThinkingHUD() {
+    stopThinkingHUD();
+    const canvas = $('#spacelineThinkingCanvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    thinkingCanvas = canvas;
+    const size = 36;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = 36 * dpr;
+    canvas.height = 36 * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    function draw(now) {
+      if (thinkingCanvas !== canvas || !canvas.isConnected) return;
+      const time = reduceMotion ? 0 : now / 1000;
+      const pulse = reduceMotion ? 1 : 0.82 + Math.sin(time * 5.4) * 0.15;
+      ctx.clearRect(0, 0, size, size);
+      ctx.save();
+      ctx.translate(18, 18);
+
+      // Compact adaptation of the supplied cyan/amber Spaceline HUD: three rings,
+      // short segmented tracks and a pulsing core, sized for an inline status.
+      ctx.strokeStyle = 'rgba(0,243,255,.34)';
+      ctx.lineWidth = 0.85;
+      ctx.setLineDash([2, 2.8]);
+      ctx.beginPath(); ctx.arc(0, 0, 15, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.save();
+      ctx.rotate(time * 0.95);
+      ctx.strokeStyle = 'rgba(255,170,0,.78)';
+      ctx.lineWidth = 1.5;
+      ctx.shadowColor = '#ffaa00'; ctx.shadowBlur = 3;
+      for (let i = 0; i < 8; i++) {
+        const start = i * Math.PI / 4;
+        ctx.beginPath(); ctx.arc(0, 0, 12.2, start, start + 0.25); ctx.stroke();
+      }
+      ctx.restore();
+
+      ctx.save();
+      ctx.rotate(-time * 1.35);
+      ctx.strokeStyle = 'rgba(0,243,255,.8)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(0, 0, 8.7, 0, Math.PI * 2); ctx.stroke();
+      for (let i = 0; i < 4; i++) {
+        const angle = i * Math.PI / 2;
+        ctx.fillStyle = '#00eaf5';
+        ctx.beginPath(); ctx.arc(Math.cos(angle) * 8.7, Math.sin(angle) * 8.7, 1.15, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.restore();
+
+      const glow = ctx.createRadialGradient(0, 0, 1, 0, 0, 6.8);
+      glow.addColorStop(0, 'rgba(255,255,255,.95)');
+      glow.addColorStop(.35, 'rgba(0,243,255,.5)');
+      glow.addColorStop(1, 'rgba(0,243,255,0)');
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(0, 0, 6.8 * pulse, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#f4ffff';
+      ctx.shadowColor = '#00f3ff'; ctx.shadowBlur = 7 * pulse;
+      ctx.beginPath(); ctx.arc(0, 0, 1.65 * pulse, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+
+      if (!reduceMotion) thinkingFrame = requestAnimationFrame(draw);
+    }
+    draw(performance.now());
+  }
+  function setTitle(title) { $('#viewTitle').textContent = title; }
+  function providerName(provider) {
+    const preset = state.providerPresets.find(item => item.id === provider);
+    return preset?.label || ({'openai-compatible':'Custom OpenAI-compatible / FreeLLM','anthropic':'Anthropic Claude','gemini':'Google Gemini','edenai':'Eden AI','aihorde':'AI Horde · Free Images','ollama':'Ollama (local)'})[provider] || provider;
+  }
+  function providerPreset(provider) { return state.providerPresets.find(item => item.id === provider) || null; }
+  function isEdenImageProfile(profile) {
+    if (!profile) return false;
+    if (profile.provider === 'edenai') return true;
+    try {
+      const url = new URL(profile.base_url || '');
+      return profile.provider === 'openai-compatible' && url.protocol === 'https:' && url.hostname.toLowerCase() === 'api.edenai.run' && url.pathname.replace(/\/+$/, '') === '/v3';
+    } catch (_) { return false; }
+  }
+  function isAIHordeImageProfile(profile) { return Boolean(profile && profile.provider === 'aihorde'); }
+  function isRemoteImageModelProfile(profile) { return isEdenImageProfile(profile) || isAIHordeImageProfile(profile); }
+  function supportsImageGeneration(profile) {
+    return Boolean(profile && (['openai','gemini'].includes(profile.provider) || isRemoteImageModelProfile(profile)));
+  }
+  async function loadRemoteImageModels(profileId, force = false) {
+    if (!profileId) return;
+    const status = state.imageModelStatusByProfile[profileId];
+    if (!force && (status === 'loading' || status === 'ready' || status === 'error')) return;
+    state.imageModelStatusByProfile[profileId] = 'loading';
+    if (state.view === 'images' || state.workbenchTab === 'images') refreshImageStudioView();
+    try {
+      const result = await api(`/api/images/models/${encodeURIComponent(profileId)}`);
+      const models = Array.isArray(result.models) ? result.models.filter(item => item && typeof item.id === 'string' && item.id.trim()) : [];
+      state.imageModelsByProfile[profileId] = models;
+      state.imageModelStatusByProfile[profileId] = models.length ? 'ready' : 'empty';
+      if (state.imageProfileId === profileId && models.length) {
+        const selected = models.find(item => item.id === state.imageModelId);
+        state.imageModelId = selected?.id || models[0].id;
+      }
+      if (!models.length) toast('The selected image provider returned no currently available models. Refresh later or check its status.');
+    } catch (error) {
+      state.imageModelStatusByProfile[profileId] = 'error';
+      state.imageModelErrorsByProfile[profileId] = error.message;
+    }
+    if (state.view === 'images' || state.workbenchTab === 'images') refreshImageStudioView();
+  }
+  function endpointTransportLabel(url) {
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol === 'https:') return 'HTTPS · encrypted transport';
+      const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+      if (parsed.protocol === 'http:' && (host === 'localhost' || host.endsWith('.localhost') || host === '127.0.0.1' || host === '::1')) return 'LOCAL HTTP · loopback only';
+      if (parsed.protocol === 'http:') return 'BLOCKED · remote HTTP; use HTTPS';
+      return 'Endpoint not supported';
+    } catch { return 'Endpoint not validated'; }
+  }
+  function providerNeedsKey(provider) {
+    const preset = providerPreset(provider);
+    return preset ? Boolean(preset.key_required) : !['ollama','lmstudio','vllm','localai','llamacpp'].includes(provider);
+  }
+  async function loadProviderPresets() {
+    try { const data = await api('/api/provider-presets'); state.providerPresets = data.providers || []; }
+    catch (error) { state.providerPresets = []; }
+  }
+  function selectedProfile() { return state.profiles.find(p => p.id === state.activeProfileId && p.enabled !== false) || null; }
+  function profileVerificationFingerprint(profile) {
+    const keyIds = [...new Set([...(profile.key_ids || []), profile.key_id].filter(Boolean).map(String))].sort();
+    return JSON.stringify({provider:profile.provider, base_url:profile.base_url, auth_mode:profile.auth_mode || 'bearer', key_ids:keyIds});
+  }
+  function readPersistedModelResults() {
+    try {
+      const value = JSON.parse(localStorage.getItem(MODEL_VERIFICATION_STORAGE_KEY) || '{}');
+      return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    } catch (_) { return {}; }
+  }
+  function persistVerifiedModelResults(profileId) {
+    const profile = state.profiles.find(item => item.id === profileId);
+    const result = state.bulkModelResults[profileId];
+    if (!profile || result?.status !== 'complete') return;
+    const records = readPersistedModelResults();
+    records[profileId] = {
+      fingerprint:profileVerificationFingerprint(profile),
+      verified_at:result.verified_at || Date.now(),
+      tested:Number(result.checked || result.total || 0),
+      failed_count:Number(result.failed_count || 0),
+      failure_categories:result.failure_categories && typeof result.failure_categories === 'object' ? result.failure_categories : {},
+      manual_models:Array.isArray(result.manual_models) ? result.manual_models : [],
+      manual_only:Boolean(result.manual_only),
+      working_models:Array.isArray(result.working_models) ? result.working_models : []
+    };
+    try { localStorage.setItem(MODEL_VERIFICATION_STORAGE_KEY, JSON.stringify(records)); } catch (_) { /* private browsing/storage quota: session state still works */ }
+  }
+  function removePersistedModelResults(profileId) {
+    const records = readPersistedModelResults();
+    delete records[profileId];
+    try { localStorage.setItem(MODEL_VERIFICATION_STORAGE_KEY, JSON.stringify(records)); } catch (_) { /* ignore unavailable local storage */ }
+    delete state.verifiedModelsByProfile[profileId];
+  }
+  function hydrateVerifiedModelResults() {
+    const records = readPersistedModelResults();
+    const valid = {};
+    const now = Date.now();
+    // Drop stale in-memory successes before rebuilding from the current account fingerprint.
+    state.verifiedModelsByProfile = {};
+    for (const [profileId, result] of Object.entries(state.bulkModelResults)) {
+      if (result?.status === 'complete') delete state.bulkModelResults[profileId];
+    }
+    for (const profile of state.profiles) {
+      const record = records[profile.id];
+      if (!record || record.fingerprint !== profileVerificationFingerprint(profile)) continue;
+      const verifiedAt = Number(record.verified_at || 0);
+      if (!verifiedAt || now - verifiedAt > MODEL_VERIFICATION_TTL_MS || !Array.isArray(record.working_models)) continue;
+      const working = record.working_models.filter(item => item && typeof item.id === 'string' && item.id.trim());
+      valid[profile.id] = {...record, working_models:working};
+      state.verifiedModelsByProfile[profile.id] = working;
+      state.modelsByProfile[profile.id] = working.map(item=>item.id);
+      state.modelCatalogByProfile[profile.id] = working;
+      state.bulkModelResults[profile.id] = {
+        status:'complete', total:Number(record.tested || working.length), checked:Number(record.tested || working.length),
+        working_count:working.length, failed_count:Number(record.failed_count || 0),
+        failure_categories:record.failure_categories && typeof record.failure_categories === 'object' ? record.failure_categories : {},
+        manual_models:Array.isArray(record.manual_models) ? record.manual_models.filter(id=>working.some(item=>item.id===id)) : [],
+        manual_only:Boolean(record.manual_only), working_models:working, verified_at:verifiedAt
+      };
+    }
+    try { localStorage.setItem(MODEL_VERIFICATION_STORAGE_KEY, JSON.stringify(valid)); } catch (_) { /* session state still works */ }
+  }
+  function failureCategoryLabel(category) {
+    return ({invalid_key:'invalid key',missing_key:'missing API key',billing:'billing required',access_denied:'account/model access',
+      model_not_found:'model not found',timeout:'timeout',quota:'quota/credits',
+      provider_unavailable:'provider unavailable',connection_error:'connection error',
+      invalid_request:'invalid request',unexpected:'unexpected error',provider_error:'provider error'})[category] || 'other error';
+  }
+  function formatFailureCategories(categories) {
+    return Object.entries(categories || {}).filter(([,count])=>Number(count)>0)
+      .sort((a,b)=>b[1]-a[1]).map(([category,count])=>`${Number(count)} ${failureCategoryLabel(category)}`).join(' · ');
+  }
+  function modelLabel(profile) { return profile ? `${providerName(profile.provider)}${profile.model ? ' · ' + profile.model : ' · choose model'}` : 'No model selected'; }
+
+  async function loadGeneratedImages() {
+    try {
+      const data = await api('/api/images');
+      const rows = Array.isArray(data.images) ? data.images : [];
+      const hydrated = await Promise.all(rows.map(async item => {
+        try {
+          const response = await fetch(item.url, {headers:{'X-Spaceline-Token':TOKEN}});
+          if (!response.ok) return {...item, previewUrl:null};
+          return {...item, previewUrl:URL.createObjectURL(await response.blob())};
+        } catch (_) { return {...item, previewUrl:null}; }
+      }));
+      state.generatedImages.forEach(item => { if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); });
+      state.generatedImages = hydrated;
+    } catch (error) {
+      state.generatedImages = [];
+    }
+  }
+
+  async function boot() {
+    try {
+      const status = await api('/api/status');
+      $('#serverStatus').textContent = `Local · v${status.version}`;
+    } catch (error) { $('#serverStatus').textContent = 'Offline'; }
+    await Promise.all([loadProviderPresets(), loadProviders(), loadKeys(), loadSkills(), loadPersonalization(), refreshChats(), loadProjects(), loadGeneratedImages()]);
+    renderSidebar(); render();
+  }
+  async function loadProviders() {
+    try {
+      const data = await api('/api/providers');
+      state.profiles = data.profiles || [];
+      const activeProfile = state.profiles.find(p => p.id === data.active_profile_id && p.enabled !== false) || null;
+      // No implicit first-enabled fallback. A missing selection stays visibly unselected.
+      state.activeProfileId = activeProfile?.id || null;
+      hydrateVerifiedModelResults();
+      $('#quickProvider').textContent = modelLabel(selectedProfile());
+    } catch (error) { state.profiles = []; state.activeProfileId = null; }
+  }
+  async function loadKeys() {
+    try { const data = await api('/api/keys'); state.keys = data.keys || []; }
+    catch (error) { state.keys = []; state.keyError = error.message; }
+  }
+  async function loadSkills() {
+    try { const data = await api('/api/skills'); state.skills = data.skills || []; }
+    catch (error) { state.skills = []; }
+  }
+  async function loadPersonalization() {
+    try { state.personalization = {...state.personalization, ...(await api('/api/personalization'))}; }
+    catch (_) { /* Existing local defaults remain usable if preferences cannot load. */ }
+  }
+  async function refreshChats() {
+    try { const data = await api('/api/chats'); state.chats = data.chats || []; renderSidebar(); }
+    catch (error) { state.chats = []; }
+  }
+  async function loadProjects() {
+    try { const data = await api('/api/projects'); state.projects = data.projects || []; }
+    catch (error) { state.projects = []; }
+  }
+  async function setActiveProfile(profileId, alreadyConfirmed = false) {
+    const nextProfile = state.profiles.find(item => item.id === profileId && item.enabled !== false) || null;
+    if (!nextProfile) { toast('Choose an enabled provider connection.'); return false; }
+    const currentProfile = selectedProfile();
+    const switching = Boolean(currentProfile && currentProfile.id !== nextProfile.id);
+    if (switching && !alreadyConfirmed) {
+      const approved = await confirmModelSwitch(currentProfile, nextProfile,
+        'Spaceline will use this connection for your next request. It will not silently change back or route to another model.');
+      if (!approved) { render(); return false; }
+    }
+    try {
+      const activePayload = switching ? {profile_id:profileId, confirm_switch: true} : {profile_id:profileId, confirm_switch: false};
+      await api('/api/providers/active', {method:'POST', body:JSON.stringify(activePayload)});
+      state.activeProfileId = profileId;
+      $('#quickProvider').textContent = modelLabel(selectedProfile());
+      toast('Selected model updated');
+      return true;
+    } catch (error) { toast(error.message); render(); return false; }
+  }
+
+  function renderSidebar() {
+    $$('.nav-item').forEach(button => button.classList.toggle('active', button.dataset.view === state.view && !(state.mode === 'code' && button.dataset.view === 'projects')));
+    $$('.mode').forEach(button => button.classList.toggle('active', button.dataset.mode === state.mode));
+    const taskList = $('#taskList');
+    const list = state.chats.slice(0, 8);
+    taskList.innerHTML = list.length ? list.map(chat => `<div class="task-row-wrap"><button type="button" class="task-row ${chat.id === state.activeChatId ? 'active' : ''}" data-chat-open="${escapeHTML(chat.id)}" title="${escapeHTML(chat.title)}"><span>${escapeHTML(chat.title || 'New chat')}</span></button><button type="button" class="chat-delete sidebar-chat-delete" data-chat-delete="${escapeHTML(chat.id)}" aria-label="Delete chat" title="Delete chat" ${state.sendInProgress && chat.id === state.activeChatId ? 'disabled' : ''}>×</button></div>`).join('') : '<div class="quiet-note">Your recent chats will appear here.</div>';
+    $('#quickProvider').textContent = modelLabel(selectedProfile());
+  }
+  function navigate(view) {
+    state.view = view; if (view === 'chat' && !state.activeChatId) state.activeChat = null;
+    renderSidebar(); render();
+  }
+  function commandDefinitions() {
+    return [
+      {id:'new-chat',label:'New chat',detail:'Start a fresh conversation',group:'Workspace',keywords:'chat compose conversation',run:()=>{state.activeChatId=null;state.activeChat=null;state.attachments=[];navigate('chat');}},
+      {id:'search',label:'Search conversations',detail:'Find a past chat',group:'Workspace',keywords:'find search history',run:()=>{navigate('search');setTimeout(()=>$('#chatSearch')?.focus(),0);}},
+      {id:'projects',label:'Open projects',detail:'Browse project folders and files',group:'Workspace',keywords:'code files folders',run:async()=>{await loadProjects();navigate('projects');}},
+      {id:'artifacts',label:'Open artifacts',detail:'Saved notes, prompts and snippets',group:'Workspace',keywords:'notes saved snippets',run:async()=>{await loadNotes();navigate('artifacts');}},
+      {id:'image-studio',label:'Open Image Studio',detail:'Generate visuals and browse your local gallery',group:'Creation',keywords:'image generation art picture create visual',run:()=>navigate('images')},
+      {id:'browser',label:'Open browser workbench',detail:'Search and inspect websites in the right panel',group:'Tools',keywords:'web research chrome chromium',run:()=>{state.researchTaskActive=false;state.view='chat';state.workbenchTab='browser';state.workbenchCollapsed=false;saveWorkspacePreferences();renderSidebar();render();}},
+      {id:'code',label:'Open code workspace',detail:'Switch to project editing',group:'Tools',keywords:'editor terminal build',run:async()=>{state.mode='code';await loadProjects();if(!state.selectedProject&&state.projects.length)state.selectedProject=state.projects[0];state.view='projects';await loadProjectFiles();renderSidebar();render();}},
+      {id:'providers',label:'Manage providers and models',detail:'Choose the connection and model Spaceline will use',group:'Settings',keywords:'model api key endpoint connection customize',run:()=>openCustomizeTab('providers')},
+      {id:'skills',label:'Manage skills',detail:'Inspect or import specialist SKILL.md packs',group:'Settings',keywords:'agents tools expertise customize',run:async()=>{await loadSkills();openCustomizeTab('skills');}},
+      {id:'browser-settings',label:'Browser and local tools',detail:'Review browser and project tool settings',group:'Settings',keywords:'connectors tools',run:()=>openCustomizeTab('connectors')},
+      {id:'new-project',label:'Create project',detail:'Add a project folder to this workspace',group:'Create',keywords:'new folder repository',run:()=>openProjectModal()},
+      {id:'new-artifact',label:'Create artifact',detail:'Save a note, prompt or code snippet',group:'Create',keywords:'note prompt snippet document',run:()=>openArtifactModal()},
+      {id:'focus-composer',label:'Focus message composer',detail:'Jump to the chat input',group:'Navigation',keywords:'write message ask',run:()=>{state.view='chat';renderSidebar();render();$('#composerInput')?.focus();}},
+      {id:'toggle-sidebar',label:'Toggle sidebar',detail:'Expand or collapse navigation',group:'View',keywords:'layout navigation panel',run:()=>{state.collapsed=!state.collapsed;$('#sidebar').classList.toggle('collapsed',state.collapsed);saveWorkspacePreferences();}},
+      {id:'toggle-workbench',label:'Toggle right workbench',detail:'Show or hide Browser, Preview, Code and Activity',group:'View',keywords:'right panel browser preview',run:()=>{state.view='chat';state.workbenchCollapsed=!state.workbenchCollapsed;saveWorkspacePreferences();renderSidebar();render();}},
+      {id:'customize',label:'Open Customize',detail:'Manage workspace preferences',group:'Settings',keywords:'settings configuration',run:()=>openCustomizeTab('providers')}
+    ];
+  }
+  function openCommandPalette() {
+    closeToolsMenu();
+    commandPaletteActiveIndex = 0;
+    const commands = commandDefinitions();
+    showModal(`<section class="command-palette" role="dialog" aria-modal="true" aria-labelledby="commandPaletteTitle">
+      <div class="command-palette-head"><span class="command-palette-mark">⌘</span><div><h2 id="commandPaletteTitle">Command palette</h2><p>Jump anywhere or run a workspace action.</p></div><button type="button" class="command-palette-close" data-command-close aria-label="Close command palette">Esc</button></div>
+      <label class="command-palette-search"><span aria-hidden="true">⌕</span><input id="commandPaletteInput" type="search" autocomplete="off" spellcheck="false" placeholder="Search commands…" aria-label="Search commands"><kbd>Ctrl+K</kbd></label>
+      <div class="command-palette-results" id="commandPaletteResults" role="listbox" aria-label="Commands"></div>
+      <div class="command-palette-foot"><span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span><span><kbd>↵</kbd> Run command</span><span>15 commands</span></div>
+    </section>`, 'command-palette-shell');
+    const input = $('#commandPaletteInput');
+    const results = $('#commandPaletteResults');
+    $('#modalLayer').querySelector('[data-command-close]')?.addEventListener('click', closeModal);
+    let filtered = commands;
+    function paint() {
+      const query = input.value.trim().toLowerCase();
+      filtered = commands.filter(command => `${command.label} ${command.detail} ${command.group} ${command.keywords}`.toLowerCase().includes(query));
+      commandPaletteActiveIndex = Math.min(commandPaletteActiveIndex, Math.max(0, filtered.length - 1));
+      if (!filtered.length) { results.innerHTML = '<div class="command-palette-empty">No commands match that search.</div>'; return; }
+      results.innerHTML = filtered.map((command,index)=>`<button type="button" role="option" aria-selected="${index===commandPaletteActiveIndex?'true':'false'}" class="command-palette-item ${index===commandPaletteActiveIndex?'active':''}" data-command-id="${command.id}"><span class="command-palette-item-icon">${command.group==='Tools'?'◇':command.group==='Settings'?'⚙':command.group==='Create'?'＋':'↗'}</span><span class="command-palette-item-copy"><strong>${escapeHTML(command.label)}</strong><small>${escapeHTML(command.detail)}</small></span><span class="command-palette-group">${escapeHTML(command.group)}</span></button>`).join('');
+      results.querySelectorAll('[data-command-id]').forEach((button,index)=>{
+        button.addEventListener('mouseenter',()=>{commandPaletteActiveIndex=index;syncActive();});
+        button.addEventListener('click',()=>runCommand(filtered[index]));
+      });
+    }
+    function syncActive() {
+      results.querySelectorAll('[data-command-id]').forEach((button,index)=>{
+        const active=index===commandPaletteActiveIndex;
+        button.classList.toggle('active',active);button.setAttribute('aria-selected',active?'true':'false');
+      });
+      results.querySelector('[aria-selected="true"]')?.scrollIntoView({block:'nearest'});
+    }
+    async function runCommand(command) {
+      if (!command) return;
+      closeModal();
+      try { await command.run(); } catch(error) { toast(error.message || 'Command could not be completed.'); }
+    }
+    input.addEventListener('input',()=>{commandPaletteActiveIndex=0;paint();});
+    input.addEventListener('keydown',event=>{
+      if (event.key==='ArrowDown') {event.preventDefault();commandPaletteActiveIndex=Math.min(commandPaletteActiveIndex+1,Math.max(0,filtered.length-1));syncActive();}
+      else if (event.key==='ArrowUp') {event.preventDefault();commandPaletteActiveIndex=Math.max(0,commandPaletteActiveIndex-1);syncActive();}
+      else if (event.key==='Enter') {event.preventDefault();runCommand(filtered[commandPaletteActiveIndex]);}
+      else if (event.key==='Escape') {event.preventDefault();closeModal();}
+    });
+    paint(); input.focus();
+  }
+  function render() {
+    const root = $('#viewRoot');
+    if (state.view === 'chat') { setTitle(state.activeChat?.title || 'New chat'); root.innerHTML = renderChat(); bindChat(); }
+    else if (state.view === 'search') { setTitle('Search'); root.innerHTML = renderSearch(); bindSearch(); }
+    else if (state.view === 'projects') { setTitle('Projects'); root.innerHTML = renderProjects(); bindProjects(); }
+    else if (state.view === 'artifacts') { setTitle('Artifacts'); root.innerHTML = renderArtifacts(); bindArtifacts(); }
+    else if (state.view === 'scheduled') { setTitle('Scheduled'); root.innerHTML = renderScheduled(); }
+    else if (state.view === 'images') { setTitle('Image Studio'); root.innerHTML = renderImageStudioPage(); bindImageStudioPage(); }
+    else if (state.view === 'customize') { setTitle('Customize'); root.innerHTML = renderCustomize(); bindCustomize(); }
+  }
+
+  // --- Chat ---------------------------------------------------------------
+  const TASK_MODES = [
+    {id:'chat', label:'Chat', icon:'✦', hint:'Direct conversation with your selected model', group:'Conversation', quick:true},
+    {id:'web_search', label:'Web Search', icon:'⌕', hint:'Search live pages and cite useful sources', group:'Research', quick:true},
+    {id:'deep_think', label:'Deep Think', icon:'◈', hint:'Structure hard problems, assumptions, trade-offs and checks', group:'Reasoning', quick:true},
+    {id:'deep_research', label:'Deep Research', icon:'⌘', hint:'Multi-source research, comparison and synthesis', group:'Research', quick:true},
+    {id:'architect', label:'Architect', icon:'⌂', hint:'Read-only project analysis and technical blueprints', group:'Development'},
+    {id:'build', label:'Build / Execute', icon:'⚒', hint:'Implement features and run approved checks', group:'Development', quick:true},
+    {id:'debug', label:'Debug / Self-Fix', icon:'⌁', hint:'Reproduce bugs, fix and retest in bounded loops', group:'Development'},
+    {id:'review', label:'Review / Audit', icon:'◎', hint:'Read-only code, Git, security and performance review', group:'Development'},
+    {id:'autonomous', label:'Autonomous', icon:'✧', hint:'Multi-step execution inside approved permissions', group:'Development'},
+    {id:'file_analysis', label:'File Analysis', icon:'▤', hint:'Read and analyze documents and project files', group:'Analysis'},
+    {id:'data_analysis', label:'Data Analysis', icon:'▥', hint:'Inspect datasets, quality, patterns and results', group:'Analysis'},
+    {id:'learn', label:'Learn / Tutor', icon:'⌁', hint:'Interactive teaching with examples and checks', group:'Creation'},
+    {id:'writing', label:'Writing', icon:'✎', hint:'Create polished, ready-to-copy content', group:'Creation'},
+    {id:'plan', label:'Plan', icon:'☷', hint:'Milestones, dependencies, risks and execution steps', group:'Planning'},
+    {id:'summarize', label:'Summarize', icon:'≡', hint:'Extract key points, decisions and next steps', group:'Planning'},
+  ];
+  function renderAttachmentChips() {
+    if (!state.attachments.length) return '';
+    return state.attachments.map((file, index) => `<span class="attachment-chip" title="${escapeHTML(file.name)}"><span>▤</span>${escapeHTML(file.name)}<button type="button" data-remove-attachment="${index}" aria-label="Remove ${escapeHTML(file.name)}">×</button></span>`).join('');
+  }
+  function closeToolsMenu() {
+    const menu = $('#toolsMenu');
+    if (menu) menu.hidden = true;
+    $('#openToolsMenu')?.setAttribute('aria-expanded', 'false');
+  }
+  function toggleToolsMenu(force) {
+    const menu = $('#toolsMenu'); if (!menu) return;
+    const open = typeof force === 'boolean' ? force : menu.hidden;
+    menu.hidden = !open;
+    $('#openToolsMenu')?.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  function selectWorkbenchTool(tab) {
+    state.view = 'chat'; state.workbenchTab = tab; state.workbenchCollapsed = false;
+    saveWorkspacePreferences();
+    renderSidebar(); render();
+  }
+  function openCustomizeTab(tab) {
+    state.view = 'customize'; state.customizeTab = tab;
+    renderSidebar(); render();
+  }
+  function estimateConversationTokens(messages) {
+    const text = (messages || []).reduce((sum, message) => sum + String(message.content || '').length, 0);
+    return Math.ceil(text / 4) + (messages || []).length * 4;
+  }
+  function contextLimitForProfile(profile) {
+    if (!profile) return null;
+    const stored = Number(localStorage.getItem(`spaceline.contextWindow.${profile.id}`) || 0);
+    const discovered = Number(state.contextWindows[profile.id]?.context_window || 0);
+    return discovered > 0 ? discovered : (stored >= 1024 ? stored : null);
+  }
+  function renderModelUsagePanel() {
+    const profile = selectedProfile();
+    const usage = estimateConversationTokens(state.activeChat?.messages || []);
+    const limit = contextLimitForProfile(profile);
+    const remaining = limit ? Math.max(0, limit - usage) : null;
+    const pct = limit ? Math.min(100, Math.round((usage / limit) * 100)) : 0;
+    return `<div class="model-usage-wrap" id="modelUsageWrap"><button class="model-usage-button" id="modelUsageButton" type="button" aria-expanded="false" ${profile?'':'disabled'} title="Model and context usage"><span class="model-usage-dot"></span><span>${escapeHTML(profile?.model || 'No model')}</span><span class="model-usage-caret">⌃</span></button><div class="model-usage-panel" id="modelUsagePanel" hidden><div class="model-usage-heading"><strong>Model & context</strong><span>LIVE SESSION</span></div><div class="model-usage-row"><span>Provider</span><strong>${escapeHTML(profile ? providerName(profile.provider) : 'Not connected')}</strong></div><div class="model-usage-row"><span>Model</span><strong>${escapeHTML(profile?.model || 'Choose a model')}</strong></div><div class="model-usage-stat"><strong>${remaining===null?'—':remaining.toLocaleString()}</strong><span>estimated context tokens remaining</span></div><div class="model-usage-bar"><i style="width:${pct}%"></i></div><div class="model-usage-row"><span>Estimated context used</span><strong>${usage.toLocaleString()} tokens</strong></div><div class="model-usage-row"><span>Context window</span><strong>${limit?limit.toLocaleString():'Not reported'}</strong></div><form class="context-limit-form" id="contextLimitForm"><label for="contextLimitInput">Set context limit when provider does not report it</label><div><input id="contextLimitInput" type="number" min="1024" max="10000000" step="1024" placeholder="e.g. 32768" value="${limit||''}"><button class="button subtle" type="submit">Save</button></div></form><p class="model-usage-note">Token use is estimated from conversation text (about 4 characters per token), not an exact tokenizer count. API billing credits/quota are controlled by your provider and are not available here.</p></div></div>`;
+  }
+  async function refreshModelUsage() {
+    const profile = selectedProfile();
+    if (!profile) return;
+    if (!state.contextWindows[profile.id]) {
+      try { state.contextWindows[profile.id] = await api(`/api/providers/${encodeURIComponent(profile.id)}/context-window`); }
+      catch (_) { state.contextWindows[profile.id] = {context_window:null}; }
+    }
+    const panel = $('#modelUsagePanel');
+    const wrapper = $('#modelUsageWrap');
+    if (panel && wrapper) {
+      const wasOpen = !panel.hidden;
+      const holder = document.createElement('div'); holder.innerHTML = renderModelUsagePanel();
+      const replacement = holder.firstElementChild;
+      if (replacement) {
+        wrapper.replaceWith(replacement);
+        const newPanel = $('#modelUsagePanel');
+        const newButton = $('#modelUsageButton');
+        if (newPanel) newPanel.hidden = !wasOpen;
+        if (newButton) newButton.setAttribute('aria-expanded', wasOpen ? 'true' : 'false');
+        bindModelUsagePanel();
+      }
+    }
+  }
+  function bindModelUsagePanel() {
+    $('#modelUsageButton')?.addEventListener('click', async () => {
+      const panel = $('#modelUsagePanel'); if (!panel) return;
+      panel.hidden = !panel.hidden;
+      $('#modelUsageButton')?.setAttribute('aria-expanded', panel.hidden ? 'false' : 'true');
+      if (!panel.hidden) await refreshModelUsage();
+    });
+    $('#contextLimitForm')?.addEventListener('submit', event => {
+      event.preventDefault(); const profile = selectedProfile(); const input = $('#contextLimitInput');
+      const value = Number(input?.value || 0);
+      if (!profile || !Number.isInteger(value) || value < 1024 || value > 10000000) { toast('Enter a context limit between 1,024 and 10,000,000 tokens.'); return; }
+      localStorage.setItem(`spaceline.contextWindow.${profile.id}`, String(value));
+      state.contextWindows[profile.id] = { ...(state.contextWindows[profile.id] || {}), context_window:value, context_source:'user' };
+      refreshModelUsage(); toast('Context limit saved on this device');
+    });
+  }
+
+  function renderChat() {
+    const profile = selectedProfile();
+    const enabledProfiles = state.profiles.filter(p => p.enabled !== false);
+    const chosenProfileId = state.activeProfileId;
+    const options = `<option value="" ${chosenProfileId ? '' : 'selected'}>Choose a model connection…</option>` + enabledProfiles.map(p => `<option value="${escapeHTML(p.id)}" ${p.id === chosenProfileId ? 'selected' : ''}>${escapeHTML(p.name)} · ${escapeHTML(providerName(p.provider))} · ${escapeHTML(p.model || 'choose model')}</option>`).join('');
+    const projectOptions = state.projects.map(p => `<option value="${escapeHTML(p)}" ${p===state.selectedProject?'selected':''}>${escapeHTML(p)}</option>`).join('');
+    const messages = state.activeChat?.messages || [];
+    const content = messages.length ? `<div class="messages" id="messages">${messages.map((message,index)=>renderMessage(message,index)).join('')}</div>` : `
+      <div class="welcome-wrap">
+        
+        <h1 class="welcome-title">What are we building today?</h1>
+        <p class="welcome-sub">One workspace for thinking, coding, researching, and shipping real work. Pick a mode and use the workspace on the right as your live canvas.</p>
+        <div class="suggestion-grid">
+          <button class="suggestion-card" data-prompt="Help me plan and build a Python project step by step."><strong>Build a project</strong><span>Plan the architecture, files, and first implementation.</span></button>
+          <button class="suggestion-card" data-prompt="Review this code and explain what should be improved."><strong>Review my code</strong><span>Find bugs, simplify logic, and explain the changes.</span></button>
+          <button class="suggestion-card" data-prompt="Research the best current UI animation libraries and compare their documentation, examples, and licenses."><strong>Research the web</strong><span>Compare current tools, docs, templates, and references.</span></button>
+          <button class="suggestion-card" data-prompt="Help me debug an error. Ask for the exact details you need."><strong>Debug an issue</strong><span>Trace the cause and work toward a reliable fix.</span></button>
+        </div>
+      </div>`;
+    const activeMode = TASK_MODES.find(item => item.id === state.taskMode) || TASK_MODES[0];
+    const modeButtons = TASK_MODES.map(item => `<button class="tools-menu-item task-mode ${state.taskMode===item.id?'active':''}" type="button" data-task-mode="${item.id}" data-mode-group="${item.group}" data-mode-search="${escapeHTML((item.label+' '+item.hint+' '+item.group).toLowerCase())}" aria-pressed="${state.taskMode===item.id?'true':'false'}"><span class="tools-menu-icon">${item.icon}</span><span class="tools-menu-copy"><strong>${item.label}</strong><small>${item.hint}</small></span><span class="tools-menu-check">${state.taskMode===item.id?'✓':''}</span></button>`).join('');
+    const quickModeButtons = TASK_MODES.filter(item=>item.quick).map(item => `<button class="quick-mode-button ${state.taskMode===item.id?'active':''}" type="button" data-quick-task-mode="${item.id}" aria-pressed="${state.taskMode===item.id?'true':'false'}" title="${item.hint}"><span class="quick-mode-icon">${item.icon}</span><span>${item.label}</span></button>`).join('');
+    return `<div class="chat-workspace ${state.workbenchCollapsed?'workbench-collapsed':''}" id="chatWorkspace">
+      <section class="chat-main">
+        <div class="task-modebar"><div class="task-mode-current-wrap"><span class="task-mode-caption">ACTIVE MODE</span><button class="active-mode-chip" id="activeTaskMode" type="button" title="Choose a task mode"><span class="active-mode-icon">${activeMode.icon}</span><strong>${activeMode.label}</strong><span class="active-mode-chevron">⌄</span></button></div>${state.activeChatId ? `<button class="button subtle delete-chat-toolbar" id="deleteCurrentChat" type="button" ${state.sendInProgress ? 'disabled' : ''}>Delete chat</button>` : ''}</div>
+        <div class="chat-scroll" id="chatScroll">${content}</div>
+        <div class="composer-wrap"><form class="composer" id="composerForm">
+          <textarea id="composerInput" rows="2" placeholder="Message Spaceline…" aria-label="Message Spaceline">${escapeHTML(loadComposerDraft())}</textarea>
+          <nav class="quick-modebar" role="group" aria-label="Choose response mode">${quickModeButtons}</nav>
+          <div class="attachment-list" id="attachmentList">${renderAttachmentChips()}</div>
+          <div class="composer-actions"><div class="composer-left">
+            <div class="composer-plus-wrap">
+              <button class="plus-trigger" id="openToolsMenu" type="button" aria-label="Open tools and attachments" aria-haspopup="menu" aria-expanded="false" title="Tools and attachments">＋</button>
+              <div class="tools-menu" id="toolsMenu" role="menu" aria-label="Spaceline tools" hidden>
+                <div class="tools-menu-heading"><strong>Tools</strong><span>Choose what Spaceline can use</span></div>
+                <div class="tools-menu-label">MODES</div>
+                <input class="task-mode-search" id="taskModeSearch" type="search" placeholder="Find a mode…" aria-label="Search modes" autocomplete="off">
+                <div class="tools-menu-group">${modeButtons}</div>
+                <div class="tools-menu-divider"></div>
+                <div class="tools-menu-label">ADD TO YOUR MESSAGE</div>
+                <button class="tools-menu-item" type="button" data-tool-action="attach_files"><span class="tools-menu-icon">⌑</span><span class="tools-menu-copy"><strong>Documents and source files</strong><small>PDF · DOCX · XLSX · PPTX · CSV/TSV · text/code · 20 MB each · 3 files · 15,000 extracted characters</small></span></button>
+                <div class="tools-menu-divider"></div>
+                <div class="tools-menu-label">WORKSPACE</div>
+                <button class="tools-menu-item" type="button" data-tool-action="browser"><span class="tools-menu-icon">↗</span><span class="tools-menu-copy"><strong>Browser</strong><small>Search the web, inspect pages and templates</small></span></button>
+                <button class="tools-menu-item" type="button" data-tool-action="templates"><span class="tools-menu-icon">▦</span><span class="tools-menu-copy"><strong>UI libraries & motion references</strong><small>Browse component, animation and prompt resources</small></span></button>
+                <button class="tools-menu-item" type="button" data-tool-action="code"><span class="tools-menu-icon">{ }</span><span class="tools-menu-copy"><strong>Code editor</strong><small>Edit project files in the workspace</small></span></button>
+                <button class="tools-menu-item" type="button" data-tool-action="preview"><span class="tools-menu-icon">◫</span><span class="tools-menu-copy"><strong>Live preview</strong><small>Preview your selected HTML project file</small></span></button>
+                <button class="tools-menu-item" type="button" data-tool-action="files"><span class="tools-menu-icon">▤</span><span class="tools-menu-copy"><strong>Project files</strong><small>Browse files in your selected project</small></span></button>
+                <div class="tools-menu-divider"></div>
+                <div class="tools-menu-label">EXTENSIONS</div>
+                <button class="tools-menu-item" type="button" data-tool-action="skills"><span class="tools-menu-icon">✳</span><span class="tools-menu-copy"><strong>Skills</strong><small>${state.skills.length} local skills · auto-activated when relevant</small></span></button>
+                <button class="tools-menu-item" type="button" data-tool-action="plugins"><span class="tools-menu-icon">⌘</span><span class="tools-menu-copy"><strong>Integration status</strong><small>See what is connected and what is not yet integrated</small></span></button>
+                <button class="tools-menu-item" type="button" data-tool-action="connectors"><span class="tools-menu-icon">⛓</span><span class="tools-menu-copy"><strong>Connectors & browser access</strong><small>Configure the embedded browser and local tools</small></span></button>
+                <button class="tools-menu-item" type="button" data-tool-action="providers"><span class="tools-menu-icon">◉</span><span class="tools-menu-copy"><strong>AI providers & models</strong><small>${state.profiles.length} provider connection${state.profiles.length===1?'':'s'} configured</small></span></button>
+                <button class="tools-menu-item" type="button" data-tool-action="image_generate"><span class="tools-menu-icon">✧</span><span class="tools-menu-copy"><strong>Generate an image</strong><small>OpenAI GPT Image · separate image API charge</small></span><span class="tools-menu-state">Open</span></button>
+              </div>
+              <input id="composerFileInput" type="file" multiple hidden accept=".txt,.md,.markdown,.json,.csv,.html,.htm,.css,.js,.jsx,.ts,.tsx,.py,.java,.c,.cpp,.h,.sql,.yaml,.yml,.toml,.xml,.log,.sh,.ps1,.bat,.ini,.pdf,.docx,.xlsx,.pptx,.tsv" />
+            </div>
+            <select class="composer-select" id="profileSelect" aria-label="Choose provider" ${enabledProfiles.length ? '' : 'disabled'}>${options}</select>
+            <button class="button subtle model-picker-trigger" id="openModelPicker" type="button" title="Browse model IDs exposed by this provider; test access for your account" ${profile ? '' : 'disabled'}><span class="model-trigger-label">${escapeHTML(profile?.model || 'Choose model')}</span><span class="model-trigger-action">Models ↻</span></button>
+            <select class="composer-select" id="projectContext" aria-label="Project context"><option value="">No project context</option>${projectOptions}</select>
+          </div><div class="composer-right"><span class="composer-hint">Enter to send · Shift + Enter for a new line</span><button class="send-button" id="sendButton" type="submit" ${profile ? '' : 'disabled'} aria-label="Send message">↑</button></div></div>
+        </form><div class="composer-privacy">Cloud models receive your prompt and attached file contents. Local Ollama stays on this PC. API keys remain in Windows Credential Manager.</div></div>
+      </section>
+      ${renderWorkbench()}
+    </div>`;
+  }
+  function renderImageStudioPage() {
+    const previousWorkbenchTab = state.workbenchTab;
+    state.workbenchTab = 'images';
+    const imageContent = renderWorkbenchTab();
+    state.workbenchTab = previousWorkbenchTab;
+    const supported = state.profiles.filter(profile => profile.enabled !== false && supportsImageGeneration(profile));
+    return `<div class="image-studio-page">
+      <header class="image-studio-hero">
+        <div class="image-studio-hero-copy"><div class="image-studio-eyebrow"><span class="image-studio-orb">✧</span> SPACELINE CREATIVE TOOLS <span class="image-studio-eyebrow-line"></span> IMAGE GENERATION</div>
+          <h1>Make the idea <em>visible.</em></h1><p>A dedicated canvas for turning prompts into polished visuals. Generate, review and keep every result inside your local workspace.</p>
+          <div class="image-studio-capabilities"><span>✦ Prompt to image</span><span>◫ Multiple aspect ratios</span><span>▤ Local gallery</span></div>
+        </div>
+        <div class="image-studio-hero-side"><div class="image-studio-status"><span class="image-studio-status-dot"></span>${supported.length ? `${supported.length} image connection${supported.length===1?'':'s'} ready` : 'Connect a provider to begin'}</div><div class="image-studio-stat"><strong>${state.generatedImages.length}</strong><span>saved creations</span></div><div class="image-studio-stat-foot">Your gallery stays on this device</div></div>
+      </header>
+      ${imageContent}
+    </div>`;
+  }
+  function bindImageStudioPage() {
+    bindWorkbench();
+    try {
+      const recovery = JSON.parse(localStorage.getItem('spaceline.imageSessionRecovery.v1') || 'null');
+      if (recovery && Date.now() - Number(recovery.saved_at || 0) < 10 * 60 * 1000) {
+        if (recovery.prompt && !state.imagePrompt) state.imagePrompt = String(recovery.prompt).slice(0, 4000);
+        if (recovery.profileId) state.imageProfileId = String(recovery.profileId);
+        if (recovery.model) state.imageModelId = String(recovery.model);
+        if (recovery.aspectRatio) state.imageAspectRatio = String(recovery.aspectRatio);
+        if (recovery.quality) state.imageQuality = String(recovery.quality);
+        localStorage.removeItem('spaceline.imageSessionRecovery.v1');
+        const prompt = $('#imagePrompt');
+        if (prompt && state.imagePrompt) prompt.value = state.imagePrompt;
+      } else if (recovery) {
+        localStorage.removeItem('spaceline.imageSessionRecovery.v1');
+      }
+    } catch (_) { /* ignore unavailable/corrupt local recovery state */ }
+  }
+  function refreshImageStudioView() {
+    if (state.view === 'images') {
+      const root = $('#viewRoot');
+      if (root) { root.innerHTML = renderImageStudioPage(); bindImageStudioPage(); }
+    } else refreshWorkbench();
+  }
+
+  function renderWorkbench() {
+    const tabs = [['browser','Browser'],['preview','Preview'],['code','Code'],['files','Files'],['review','Review'],['images','Images'],['activity','Activity']];
+    return `<aside class="workbench" id="workbench" aria-label="Live workbench">
+      <header class="workbench-header"><div class="workbench-heading"><span class="workbench-eyebrow">SPACELINE WORKSPACE</span><strong>Task workspace</strong></div><div class="workbench-actions"><span class="live-dot"></span><button class="icon-button small" id="refreshWorkbench" type="button" title="Refresh panel">↻</button><button class="icon-button small" id="collapseWorkbench" type="button" title="Hide workspace">›</button></div></header>
+      <nav class="workbench-tabs" role="tablist" aria-label="Workspace panel">${tabs.map(([id,label])=>`<button type="button" class="workbench-tab ${state.workbenchTab===id?'active':''}" data-workbench-tab="${id}" aria-selected="${state.workbenchTab===id?'true':'false'}">${label}</button>`).join('')}</nav>
+      <div class="workbench-body" id="workbenchBody">${renderWorkbenchTab()}</div>
+      <footer class="workbench-footer"><span>LOCAL WORKSPACE</span><span>${state.selectedProject ? escapeHTML(state.selectedProject) : 'No project selected'}</span></footer>
+    </aside>`;
+  }
+  function renderGitWorktrees() {
+    if (!state.selectedProject) return '<div class="empty-panel compact">Select a Git project to create an isolated task workspace.</div>';
+    const current = state.gitWorktreesProject === state.selectedProject ? state.gitWorktrees : [];
+    const rows = current.map(item => `<div class="worktree-row"><div class="worktree-row-copy"><strong>${escapeHTML(item.project)}</strong><span>${escapeHTML(item.branch)} · ${item.dirty ? 'modified' : 'clean'}</span></div><button type="button" class="button subtle" data-worktree-open="${escapeHTML(item.project)}">Open</button></div>`).join('');
+    const error = state.gitWorktreesError ? `<p class="worktree-error" role="status">${escapeHTML(state.gitWorktreesError)}</p>` : '';
+    const loading = state.gitWorktreesLoading ? '<p class="worktree-empty">Loading isolated workspaces…</p>' : '';
+    return `<section class="git-review-card worktree-card"><div class="git-review-card-head"><div><strong>Isolated task workspaces</strong><span>Codex-style Git worktrees</span></div><button type="button" class="button subtle" id="refreshGitWorktrees" ${state.gitWorktreesLoading?'disabled':''}>↻</button></div><div class="worktree-create-body"><p>Create a separate branch and project folder so another chat/task can work without changing this checkout.</p><form id="createWorktreeForm" class="worktree-create-form"><input id="worktreeName" name="name" maxlength="50" required placeholder="Task name · e.g. redesign-settings" aria-label="New isolated task name"><button type="submit" class="button primary" ${state.gitWorktreesLoading?'disabled':''}>Create</button></form><p class="worktree-safety-note">Starts from the current committed HEAD. Uncommitted changes in the base project are not copied. The original project is left untouched.</p>${error}${loading}<div class="worktree-list">${rows || (!state.gitWorktreesLoading && !state.gitWorktreesError ? '<div class="worktree-empty">No isolated workspaces yet.</div>' : '')}</div></div></section>`;
+  }
+
+  function renderGitReview() {
+    const review = state.gitReview?.project === state.selectedProject ? state.gitReview : null;
+    const statusText = review?.status?.trim() || 'No tracked file changes detected.';
+    const diffText = review?.diff?.trim() || 'No unstaged tracked diff is available.';
+    const statusCount = statusText === 'No tracked file changes detected.' ? 0 : statusText.split('\n').filter(Boolean).length;
+    const reviewContent = !state.selectedProject
+      ? '<div class="empty-panel preview-empty">Select a project in the chat composer or Projects view to inspect its Git changes.</div>'
+      : state.gitReviewError
+      ? `<div class="git-review-error" role="alert">${escapeHTML(state.gitReviewError)}</div>`
+      : state.gitReviewLoading && !review
+      ? '<div class="empty-panel preview-empty">Reading the Git working tree…</div>'
+      : `<section class="git-review-card"><div class="git-review-card-head"><strong>Working tree</strong><span>${statusCount} tracked change${statusCount===1?'':'s'}</span></div><pre class="git-review-status">${escapeHTML(statusText)}</pre></section><section class="git-review-card git-review-diff-card"><div class="git-review-card-head"><strong>Unstaged diff</strong><span>Read-only · secrets redacted</span></div><pre class="git-review-diff">${escapeHTML(diffText)}</pre></section><p class="git-review-footnote">Read-only view of tracked files. Untracked files and staged changes are not shown in this release. Spaceline will not stage, commit, reset or modify your repository from this panel.${review?.redactions?` ${review.redactions} sensitive pattern(s) were masked.`:''}</p>`;
+    return `<div class="git-review-workspace"><div class="preview-toolbar"><div><strong>Review changes</strong><span>${escapeHTML(state.selectedProject || 'Select a project to review')}</span></div><button type="button" class="button subtle" id="refreshGitReview" ${!state.selectedProject || state.gitReviewLoading?'disabled':''}>${state.gitReviewLoading?'Checking…':'↻ Refresh'}</button></div>${reviewContent}${renderGitWorktrees()}</div>`;
+  }
+
+  function renderWorkbenchTab() {
+    if (state.workbenchTab === 'browser') {
+      const shortcuts = [
+        ['shadcn/ui','https://ui.shadcn.com/docs/components'],['Motion','https://motion.dev/docs/react'],
+        ['React Bits','https://www.reactbits.dev/'],['Aceternity','https://ui.aceternity.com/components'],
+        ['Magic UI','https://magicui.design/'],['GitHub UI','https://github.com/topics/ui-components'],
+        ['Vercel templates','https://vercel.com/templates'],['Prompt guide','https://www.promptingguide.ai/'],
+        ['Awesome prompts','https://github.com/f/awesome-chatgpt-prompts'],['Awwwards','https://www.awwwards.com/websites/'],
+        ['Tailwind','https://tailwindcss.com/docs'],
+      ];
+      const page = state.browserData;
+      const pageHeader = page ? `<div class="browser-page-meta"><div><strong>${escapeHTML(page.title || 'Browser page')}</strong><span>${escapeHTML(page.url)}</span></div><button class="button subtle" id="readBrowserPage" type="button">Refresh</button></div>` : '';
+      const screenshot = state.browserScreenshotUrl
+        ? `<div class="browser-screenshot-wrap"><img class="browser-screenshot" src="${state.browserScreenshotUrl}" alt="Current browser page preview" onerror="this.hidden=true"></div>`
+        : (page ? '<div class="empty-panel compact">Page preview is not available yet.</div>' : '');
+      const pageDetails = page
+        ? `<details class="browser-text-details"><summary>Readable page content · ${page.text?.length || 0} characters</summary><pre>${escapeHTML((page.text || '').slice(0,9000))}${page.truncated?'\n\n[Page text truncated]':''}</pre></details>`
+        : `<div class="browser-empty"><div class="browser-empty-icon">↗</div><strong>Your browser workspace</strong><p>Open a website, inspect a design system, compare templates, or tell Spaceline what to do in the command bar.</p><div class="browser-empty-note">Spaceline embedded Chromium · isolated persistent profile · not your everyday Chrome session.</div></div>`;
+      return `<div class="browser-workspace"><form class="browser-address" id="workbenchBrowserForm"><span>⌕</span><input id="workbenchBrowserUrl" value="${escapeHTML(page?.url || '')}" placeholder="Search or enter a URL…" aria-label="Browser address"><button class="button primary" type="submit">Browse</button></form>
+        <div class="browser-shortcuts">${shortcuts.map(([label,url])=>`<button type="button" class="source-chip" data-browser-url="${url}">${label}</button>`).join('')}</div>
+        ${pageHeader}${screenshot}
+        <section class="browser-command-panel"><div class="browser-command-title"><strong>Browser controls</strong><span>COMMAND BAR</span></div><form id="browserCommandForm" class="browser-command-form"><input id="browserCommandInput" maxlength="1000" autocomplete="off" placeholder="Tell Spaceline what to do in this page…" aria-label="Browser command"><button class="button primary" type="submit" id="browserCommandRun" ${state.browserCommandBusy?'disabled aria-busy="true"':''}>${state.browserCommandBusy?'Working…':'Run'}</button></form><div class="browser-command-status" id="browserCommandStatus" role="status" aria-live="polite">${escapeHTML(state.browserCommandStatus || 'Try: search for a topic · click Pricing · type a query into Search · check Remember me · scroll down')}</div><div class="browser-command-safety">Can navigate, click ordinary links/buttons/tabs, fill non-sensitive text fields, change ordinary checkboxes/select menus, hover and scroll. It will not submit forms or handle passwords, payments or destructive actions.</div></section>
+        ${pageDetails}
+      </div>`;
+    }
+    if (state.workbenchTab === 'review') return renderGitReview();
+    if (state.workbenchTab === 'preview') {
+      const isHtml = Boolean(state.activeFile && /\.html?$/i.test(state.activeFile) && state.selectedProject);
+      const src = isHtml ? projectPreviewUrl() : '';
+      return `<div class="preview-workspace"><div class="preview-toolbar"><div><strong>Live preview</strong><span>${isHtml?escapeHTML(state.activeFile):'Select an HTML file in a project'}</span></div><div class="preview-toolbar-actions">${isHtml?'<button type="button" class="button subtle" id="refreshLivePreview">↻ Refresh</button>':''}<button type="button" class="button subtle" id="previewOpenCode">Open code</button></div></div>${isHtml?`<iframe class="live-preview-frame" title="Project live preview" src="${src}" sandbox="allow-scripts"></iframe>`:`<div class="empty-panel preview-empty">No preview target selected.<br>Open a project, then select an HTML file from the Files tab.</div>`}</div>`;
+    }
+    if (state.workbenchTab === 'code') {
+      const isHtml = Boolean(state.activeFile && /\.html?$/i.test(state.activeFile) && state.selectedProject && !state.activeDocument);
+      const documentView = state.activeDocument ? renderDocumentPreview() : (state.activeFile ? `<textarea id="workbenchCodeEditor" class="workbench-code-editor" spellcheck="false" aria-label="Project file editor">${escapeHTML(state.codeContent)}</textarea>` : '<div class="empty-panel preview-empty">Choose a project file from the Files tab to edit it here.</div>');
+      const previewPane = isHtml ? `<section class="code-preview-pane"><div class="code-preview-pane-head"><div><strong>Live preview</strong><span>Updates after Spaceline saves your edits</span></div><button type="button" class="button subtle" id="refreshCodePreview">↻</button></div><iframe class="code-inline-preview-frame" title="Live HTML preview" src="${projectPreviewUrl()}" sandbox="allow-scripts"></iframe></section>` : (state.activeFile && !state.activeDocument ? '<aside class="code-preview-unavailable"><strong>Preview not available for this file</strong><span>Open an HTML file to see the live page next to your code.</span></aside>' : '');
+      const editorStatus = state.editorDirty ? 'Unsaved changes' : 'Saved';
+      return `<div class="code-workspace"><div class="preview-toolbar"><div><strong>${escapeHTML(state.activeFile || 'Code editor')}</strong><span>${escapeHTML(state.selectedProject || 'No project selected')}</span></div><div class="code-toolbar-actions">${isHtml?'<button type="button" class="button subtle" id="previewFromCode">Full preview</button>':''}${state.activeDocument?'<button type="button" class="button primary" id="askAboutActiveDocument">Ask AI about this file</button>':`<span class="editor-save-status" id="editorSaveStatus" role="status">${editorStatus}</span><button type="button" class="button primary" id="saveWorkbenchCode" ${state.activeFile&&state.selectedProject?'':'disabled'}>Save</button>`}</div></div>${state.activeDocument?documentView:`<div class="code-preview-split ${isHtml?'has-preview':''}"><section class="code-editor-pane">${documentView}</section>${previewPane}</div>`}${state.activeDocument?'':`<div class="workbench-code-foot"><button type="button" class="button subtle" id="openCodeWorkspace">Full code workspace ↗</button><span>${isHtml?'Edit on the left; the page preview refreshes after save.':'Changes are saved to the selected project folder.'}</span></div>`}</div>`;
+    }
+    if (state.workbenchTab === 'files') {
+      const rows = state.files.map(item=>`<button type="button" class="workbench-file ${item.path===state.activeFile?'active':''}" data-workbench-file="${escapeHTML(item.path)}"><span>${item.type==='folder'?'▱':'◇'}</span><span>${escapeHTML(item.path)}</span></button>`).join('');
+      const matches = state.fileSearchResults.map(item=>`<button type="button" class="file-search-result" data-file-match="${escapeHTML(item.path)}"><strong>${escapeHTML(item.path)}</strong><span>${escapeHTML(item.excerpt)}</span></button>`).join('');
+      return `<div class="files-workspace"><div class="preview-toolbar"><div><strong>Project files</strong><span>${escapeHTML(state.selectedProject || 'Select a project')}</span></div><button type="button" class="button subtle" id="chooseWorkbenchProject">${state.selectedProject?'Change':'Select'} project</button></div><form id="projectFileSearchForm" class="project-file-search"><input id="projectFileSearchInput" minlength="2" maxlength="200" value="${escapeHTML(state.fileSearchQuery)}" placeholder="Search code and documents…" aria-label="Search project files"><button class="button subtle" type="submit">Search</button></form>${state.fileSearchQuery.trim()?(matches?`<div class="file-search-results">${matches}</div>`:'<div class="empty-panel compact">No matching files or passages. Try a different phrase.</div>'):''}${rows || '<div class="empty-panel preview-empty">No project files loaded. Select a project to browse and edit files.</div>'}</div>`;
+    }
+    if (state.workbenchTab === 'images') {
+      const imageProfiles = state.profiles.filter(profile => profile.enabled !== false && supportsImageGeneration(profile));
+      const selectedImageProfile = imageProfiles.find(profile=>profile.id===state.imageProfileId)
+        || imageProfiles.find(profile=>profile.id===state.activeProfileId) || imageProfiles[0] || null;
+      if (selectedImageProfile) state.imageProfileId = selectedImageProfile.id;
+      const profileOptions = imageProfiles.map(profile => `<option value="${escapeHTML(profile.id)}" ${profile.id===selectedImageProfile?.id?'selected':''}>${escapeHTML(profile.name)} · ${escapeHTML(providerName(profile.provider))} · ${escapeHTML(profile.model||'image model selected in studio')}</option>`).join('');
+      const gemini = selectedImageProfile?.provider === 'gemini';
+      const edenai = isEdenImageProfile(selectedImageProfile);
+      const aihorde = isAIHordeImageProfile(selectedImageProfile);
+      const remoteModels = isRemoteImageModelProfile(selectedImageProfile);
+      const accountModels = remoteModels ? (state.imageModelsByProfile[selectedImageProfile?.id] || []) : [];
+      const remoteStatus = remoteModels ? (state.imageModelStatusByProfile[selectedImageProfile?.id] || 'not-loaded') : 'ready';
+      const modelRows = remoteModels
+        ? accountModels.map(item => [item.id, item.name || item.id])
+        : gemini
+        ? [['gemini-3.1-flash-image','Gemini 3.1 Flash Image · balanced'],['gemini-3.1-flash-lite-image','Gemini 3.1 Flash Lite Image · 1K'],['gemini-3-pro-image','Gemini 3 Pro Image · professional']]
+        : [['gpt-image-2.5-flare','GPT Image 2.5 Flare · faster'],['gpt-image-2.5-sunburst','GPT Image 2.5 Sunburst · precision'],['gpt-image-2.6-flare','GPT Image 2.6 Flare'],['gpt-image-2.6-sunburst','GPT Image 2.6 Sunburst']];
+      const requestedModel = state.imageModelId || (remoteModels ? (accountModels[0]?.id || '') : gemini ? 'gemini-3.1-flash-image' : 'gpt-image-2.5-flare');
+      const modelOptions = modelRows.length
+        ? modelRows.map(([id,label])=>`<option value="${escapeHTML(id)}" ${id===requestedModel?'selected':''}>${escapeHTML(label)}</option>`).join('')
+        : `<option value="">${remoteStatus==='loading'?'Loading image models…':remoteStatus==='error'?'Could not load image models':'Load available image models'}</option>`;
+      const ratioRows = remoteModels
+        ? [['1:1','Square'],['3:2','Landscape'],['2:3','Portrait'],['16:9','Widescreen'],['9:16','Vertical'],['4:3','Classic landscape'],['3:4','Classic portrait'],['4:5','Portrait social'],['5:4','Landscape social'],['21:9','Ultrawide']]
+        : gemini
+        ? [['1:1','Square'],['3:2','Landscape'],['2:3','Portrait'],['16:9','Widescreen'],['9:16','Vertical'],['4:3','Classic landscape'],['3:4','Classic portrait'],['4:5','Portrait social'],['5:4','Landscape social'],['21:9','Ultrawide'],['1:4','Tall strip'],['4:1','Wide strip'],['1:8','Extra tall'],['8:1','Extra wide']]
+        : [['1:1','Square'],['3:2','Landscape'],['2:3','Portrait'],['16:9','Widescreen'],['9:16','Vertical'],['4:3','Classic landscape'],['3:4','Classic portrait'],['4:5','Portrait social'],['5:4','Landscape social'],['21:9','Ultrawide']];
+      const ratioOptions = ratioRows.map(([id,label])=>`<option value="${id}" ${id===state.imageAspectRatio?'selected':''}>${label} · ${id}</option>`).join('');
+      const qualityRows = remoteModels ? [['medium','Provider default']] : [['low','Low'],['medium','Standard'],['high','High'],['xhigh','Ultra'],['max','Maximum']];
+      const qualityOptions = qualityRows.map(([id,label])=>`<option value="${id}" ${id===state.imageQuality?'selected':''}>${label}</option>`).join('');
+      const gallery = state.generatedImages.length ? state.generatedImages.map(item => `<article class="image-gallery-card"><div class="image-gallery-preview">${item.previewUrl?`<img src="${item.previewUrl}" alt="Generated image: ${escapeHTML(item.prompt || item.model)}">`:'<div class="image-gallery-unavailable">Preview unavailable</div>'}</div><div class="image-gallery-copy"><strong>${escapeHTML(item.model || 'Generated image')}</strong><p title="${escapeHTML(item.prompt || '')}">${escapeHTML(item.prompt || 'Image from previous Spaceline version')}</p><span>${escapeHTML(item.aspect_ratio || '—')} · ${escapeHTML(item.quality || '—')} · ${escapeHTML(item.provider || 'local file')}</span><div class="image-gallery-actions">${item.previewUrl?`<a class="button subtle" href="${item.previewUrl}" download="${escapeHTML(item.filename)}">Save</a>`:''}<button class="button subtle image-delete-button" type="button" data-image-delete="${escapeHTML(item.filename)}">Delete</button></div></div></article>`).join('') : '<div class="empty-panel compact">Your generated images will appear here and remain available after restarting Spaceline.</div>';
+      const remoteHint = remoteModels ? `<div class="image-provider-hint">${remoteStatus==='loading'?'Loading active image models…':remoteStatus==='error'?`${aihorde?'AI Horde':'Eden AI'} model lookup failed: ${escapeHTML(state.imageModelErrorsByProfile?.[selectedImageProfile.id] || 'Unknown error')}`:accountModels.length?`${accountModels.length} image models currently available from ${aihorde?'AI Horde workers':'your Eden AI account'}.`:'No active image models were returned.'} <button class="button subtle" type="button" data-refresh-image-models="${escapeHTML(selectedImageProfile?.id || '')}" ${remoteStatus==='loading'?'disabled':''}>${remoteStatus==='loading'?'Loading…':'Refresh models'}</button></div>` : '';
+      const canGenerate = imageProfiles.length && !state.imageGenerating && (!remoteModels || accountModels.length > 0);
+      return `<div class="image-workspace"><div class="image-workspace-head"><span class="workbench-eyebrow">CREATE · REFINE · COLLECT</span><h3>Start with a prompt. Finish with a visual.</h3><p>Use connected OpenAI, Google Gemini, Eden AI or free community-powered AI Horde models. Results and prompt metadata are saved to your local Spaceline workspace.</p></div><form id="imageGenerateForm" class="image-generate-form"><label for="imagePrompt">Prompt</label><textarea id="imagePrompt" rows="4" maxlength="4000" placeholder="A cinematic product scene, soft studio lighting, forest-green accents…" required>${escapeHTML(state.imagePrompt)}</textarea><label for="imageProfile">Image API connection</label><select id="imageProfile" ${imageProfiles.length?'':'disabled'}>${profileOptions || '<option value="">No enabled image-generation connection</option>'}</select><div class="image-options"><div><label for="imageModel">Image model</label><select id="imageModel" ${!modelRows.length || remoteStatus==='loading'?'disabled':''}>${modelOptions}</select>${remoteHint}</div><div><label for="imageAspectRatio">Aspect ratio</label><select id="imageAspectRatio">${ratioOptions}</select></div><div><label for="imageQuality">Quality / resolution</label><select id="imageQuality" ${remoteModels?'disabled aria-disabled="true"':''}>${qualityOptions}</select>${remoteModels?`<small class="image-provider-hint">Quality and sampling are controlled by ${aihorde?'AI Horde worker defaults':'the selected Eden AI model'}.</small>`:''}</div></div><button class="button primary image-generate-button" type="submit" ${canGenerate?'':'disabled'} ${state.imageGenerating?'aria-busy="true"':''}><span class="image-generate-button-icon">✧</span>${state.imageGenerating?'Creating your image…':'Generate image'}</button><p class="image-cost-note">OpenAI, Gemini and Eden AI may require paid API credits. AI Horde is community-powered and free: anonymous requests have the lowest queue priority; a free registered account improves priority. Results can take longer depending on volunteer workers.</p></form><section class="image-gallery-section"><div class="row-between"><div><h3>Image history</h3><p>${state.generatedImages.length} saved image${state.generatedImages.length===1?'':'s'} · newest first</p></div><button class="button subtle" id="refreshImageHistory" type="button">Refresh</button></div><div class="image-gallery-grid" id="imageGallery">${gallery}</div></section>${!imageProfiles.length?'<div class="image-provider-empty">Enable an OpenAI, Google Gemini, Eden AI or AI Horde image connection in Customize → Providers & keys to enable image generation.</div>':''}</div>`;
+    }
+    const items = state.activities.slice(0,30);
+    return `<div class="activity-workspace"><div class="activity-heading"><strong>Agent activity</strong><span>${items.length} events</span></div>${items.length?`<div class="activity-timeline">${items.map(item=>`<div class="activity-item"><span class="activity-marker ${item.kind==='error'?'error':''}"></span><div><strong>${escapeHTML(item.title)}</strong><span>${escapeHTML(item.detail || '')}</span><time>${escapeHTML(item.time || '')}</time></div></div>`).join('')}</div>`:'<div class="browser-empty"><div class="browser-empty-icon">✦</div><strong>Ready when you are</strong><p>Tool calls, browser navigation, file edits and agent progress will appear here while Spaceline works.</p></div>'}</div>`;
+  }
+  function renderDocumentPreview() {
+    const doc = state.activeDocument;
+    if (!doc) return '';
+    const detail = [doc.page_count ? `${doc.page_count} pages` : '', doc.sheet_count ? `${doc.sheet_count} sheets` : '', doc.slide_count ? `${doc.slide_count} slides` : '', doc.row_count ? `${doc.row_count} rows` : '', `${Number(doc.characters || 0).toLocaleString()} characters`].filter(Boolean).join(' · ');
+    const warnings = (doc.warnings || []).map(item=>`<div class="document-warning">${escapeHTML(item)}</div>`).join('');
+    return `<section class="document-analysis-preview"><div class="document-analysis-meta"><span class="document-format">${escapeHTML(doc.format || 'DOCUMENT')}</span><span>${escapeHTML(detail)}</span></div>${warnings}<pre class="document-extracted-text">${escapeHTML(doc.content || '')}${doc.truncated?'\n\n[Extraction truncated]':''}</pre><p class="document-analysis-footnote">Text extraction only. Embedded images, charts and scanned pages may not be represented. ${doc.format==='XLSX'?'Formula expressions and cached values are shown; formulas are not recalculated by Spaceline. ':''}Nothing in the file is executed.</p></section>`;
+  }
+  function askAboutActiveDocument() {
+    const doc = state.activeDocument;
+    if (!doc) return;
+    const raw = String(doc.content || '');
+    if (!raw.trim()) { toast('No selectable text was extracted from this file. Scanned/image-only files need OCR or vision support.'); return; }
+    if (state.attachments.length >= 3) { toast('Remove an existing attachment before adding this document.'); return; }
+    const alreadyAttached = state.attachments.reduce((sum, file) => sum + String(file.content || '').length, 0);
+    const remaining = Math.max(0, 15000 - alreadyAttached);
+    if (remaining < 500) { toast('Your current attachments use the available context space. Remove one before adding this document.'); return; }
+    const extracted = raw.slice(0, Math.min(14000, remaining));
+    state.attachments.push({name:doc.filename || state.activeFile || 'project-document', content:extracted});
+    if (extracted.length < raw.length) toast('Document text was shortened to fit the attachment limit.');
+    state.view = 'chat'; state.mode = 'cowork'; state.taskMode = 'deep_think';
+    state.workbenchTab = 'activity'; state.workbenchCollapsed = true;
+    renderSidebar(); render();
+    const input = $('#composerInput');
+    if (input) { input.value = `Read and analyze ${doc.filename || state.activeFile}. Give me a clear summary, key details, important findings, inconsistencies, and practical next steps. Mention any extraction limitations.`; persistComposerDraft(input.value); input.focus(); }
+    toast('Document content added to chat context. Review the prompt and press Send.');
+  }
+
+  function renderMessage(message, index = 0) {
+    const isUser = message.role === 'user';
+    // Every completed assistant turn gets exactly one icon-only note action,
+    // regardless of whether the reply contains prose, prompts, or code.
+    const copyNote = isUser ? '' : `<div class="message-note-actions"><button type="button" class="copy-note-button" data-copy-note="${index}" title="Copy note" aria-label="Copy note">${NOTE_COPY_ICON}</button></div>`;
+    return `<article class="message-row ${isUser ? 'user' : 'assistant'}" data-message-index="${index}"><div class="message-avatar">${isUser ? 'Y' : 'N'}</div><div class="message-body"><div class="message-meta">${isUser ? 'You' : 'Spaceline'}${message.status === 'interrupted' ? ' · interrupted' : ''}</div><div class="message-content">${renderMarkdown(message.content)}</div>${copyNote}</div></article>`;
+  }
+  function normalizeMessageCopyActions(root) {
+    if (!root) return;
+    const rows = root.matches?.('.message-row.assistant')
+      ? [root, ...root.querySelectorAll('.message-row.assistant')]
+      : [...root.querySelectorAll('.message-row.assistant')];
+    const legacyCopyLabel = /\bcopy(?:\s+(?:raw|all|full|markdown|code|message|response))?\b/i;
+    rows.forEach(row => {
+      // Markdown content is text/links only. Strip every interactive control
+      // inside it, including unlabeled legacy code-copy icons from old bundles.
+      row.querySelectorAll('.message-content button,.message-content [role="button"]').forEach(control => control.remove());
+      // Remove old toolbar actions that may survive in stale server-rendered
+      // message markup. The dedicated note button is the sole exception.
+      row.querySelectorAll('button,[role="button"],.copy-action').forEach(control => {
+        if (control.matches('[data-copy-note],[data-copy-live-note]')) return;
+        const label = [control.textContent, control.getAttribute('aria-label'), control.getAttribute('title'),
+          control.className, control.getAttribute('data-action')].filter(Boolean).join(' ');
+        const legacyDataCopy = [...control.attributes].some(attribute => attribute.name.startsWith('data-copy-')
+          && !['data-copy-note','data-copy-live-note'].includes(attribute.name));
+        if (legacyDataCopy || legacyCopyLabel.test(label) || /copy/i.test(label)) control.remove();
+      });
+      // Live streaming replies have their own hidden note action, revealed only
+      // after completion. Persisted messages are normalized to a single action.
+      if (row.querySelector('#liveAnswer')) return;
+      const body = row.querySelector('.message-body');
+      if (!body) return;
+      const actionRows = [...body.querySelectorAll('.message-note-actions')];
+      let actions = actionRows.shift();
+      actionRows.forEach(item => item.remove());
+      if (!actions) { actions = document.createElement('div'); actions.className = 'message-note-actions'; body.appendChild(actions); }
+      // Keep at most one note action even when old cached markup placed buttons
+      // in multiple toolbars or nested action rows.
+      const noteButtons = [...row.querySelectorAll('[data-copy-note]')];
+      let note = noteButtons.shift() || null;
+      noteButtons.forEach(item => item.remove());
+      if (!note) note = document.createElement('button');
+      if (note.parentElement !== actions) actions.replaceChildren(note);
+      else actions.querySelectorAll('button').forEach(item => { if (item !== note) item.remove(); });
+      note.type = 'button';
+      note.className = 'copy-note-button';
+      note.dataset.copyNote = row.dataset.messageIndex || '0';
+      note.title = 'Copy note';
+      note.setAttribute('aria-label', 'Copy note');
+      // Browsers normalize SVG innerHTML while parsing (for example, self-closing
+      // SVG tags become explicit end tags). Comparing the serialized HTML string
+      // therefore caused this MutationObserver to rewrite the icon on every pass.
+      // Check the DOM structure instead so the observer settles after one cleanup.
+      const iconOnly = note.childNodes.length === 1
+        && note.children.length === 1
+        && note.firstElementChild.matches('svg.copy-note-icon')
+        && !note.textContent.trim();
+      if (!iconOnly) note.innerHTML = NOTE_COPY_ICON;
+    });
+  }
+  function watchMessageCopyActions() {
+    const root = $('#chatScroll');
+    if (!root || root.dataset.noteCopyGuard === 'true') return;
+    root.dataset.noteCopyGuard = 'true';
+    const observer = new MutationObserver(() => normalizeMessageCopyActions(root));
+    observer.observe(root, {subtree:true, childList:true});
+    normalizeMessageCopyActions(root);
+  }
+
+  function renderMarkdown(text) {
+    const blocks = [];
+    let safe = escapeHTML(text || '');
+    safe = safe.replace(/```([\w+-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+      const cleanCode = code.trimEnd();
+      const index = blocks.push(`<pre class="spaceline-code-block"><div class="code-block-toolbar"><span>${escapeHTML(lang || 'CODE')}</span></div><code>${cleanCode}</code></pre>`) - 1;
+      return `@@BLOCK${index}@@`;
+    });
+    safe = safe.replace(/`([^`]+)`/g, '<code>$1</code>');
+    safe = safe.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    safe = safe.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    safe = safe.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+    safe = safe.replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noreferrer">$2</a>');
+    safe = safe.split(/\n{2,}/).map(part => part.startsWith('@@BLOCK') ? part : `<p>${part.replace(/\n/g,'<br>')}</p>`).join('');
+    blocks.forEach((block, i) => { safe = safe.replace(`@@BLOCK${i}@@`, block); });
+    return safe;
+  }
+  async function copyWithFeedback(text, button) {
+    const value = String(text ?? '');
+    if (!value) { toast('There is nothing to copy.'); return; }
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        const helper = document.createElement('textarea');
+        helper.value = value; helper.setAttribute('readonly','');
+        helper.style.position='fixed'; helper.style.opacity='0'; document.body.appendChild(helper);
+        helper.select(); const copied = document.execCommand('copy'); helper.remove();
+        if (!copied) throw new Error('Clipboard access is unavailable in this browser context.');
+      }
+      if (button) {
+        const isNote = button.matches('[data-copy-note],[data-copy-live-note]');
+        const original = button.dataset.originalMarkup || button.innerHTML || 'Copy';
+        if (isNote) button.dataset.originalMarkup = original;
+        button.innerHTML = isNote ? '<span aria-hidden="true">✓</span>' : '✓ Copied!';
+        button.title = isNote ? 'Note copied' : button.title;
+        if (isNote) button.setAttribute('aria-label', 'Note copied');
+        button.classList.add('copied'); button.disabled = true;
+        window.setTimeout(()=>{ if (button.isConnected) {
+          button.innerHTML = original; button.classList.remove('copied'); button.disabled=false;
+          if (isNote) { button.title='Copy note'; button.setAttribute('aria-label','Copy note'); }
+        } }, 1800);
+      } else toast('Copied to clipboard');
+    } catch (error) { toast(error.message || 'Could not copy to clipboard.'); }
+  }
+  function bindCopyControls(root) {
+    if (!root || root.dataset.copyBound === 'true') return;
+    root.dataset.copyBound = 'true';
+    root.addEventListener('click', async event => {
+      const liveButton = event.target.closest('[data-copy-live-note]');
+      if (liveButton) {
+        await copyWithFeedback(state.liveAnswer || '', liveButton);
+        return;
+      }
+      const noteButton = event.target.closest('[data-copy-note]');
+      if (noteButton) {
+        const message = state.activeChat?.messages?.[Number(noteButton.dataset.copyNote)];
+        if (!message || message.role !== 'assistant') { toast('This reply is no longer available.'); return; }
+        await copyWithFeedback(message.content, noteButton);
+      }
+    });
+  }
+  function pushActivity(title, detail = '', kind = 'info') {
+    state.activities.unshift({title, detail, kind, time:new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})});
+    state.activities = state.activities.slice(0, 60);
+    if (state.workbenchTab === 'activity') refreshWorkbench();
+  }
+  function updateTaskModeUI() {
+    const current = TASK_MODES.find(item => item.id === state.taskMode) || TASK_MODES[0];
+    const chip = $('#activeTaskMode');
+    if (chip) chip.innerHTML = `<span class="active-mode-icon">${current.icon}</span><strong>${current.label}</strong><span class="active-mode-chevron">⌄</span>`;
+    $$('.task-mode').forEach(button => {
+      const active = button.dataset.taskMode === state.taskMode;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', active ? 'true' : 'false');
+      const check = $('.tools-menu-check', button); if (check) check.textContent = active ? '✓' : '';
+    });
+    $$('[data-quick-task-mode]').forEach(button => {
+      const active = button.dataset.quickTaskMode === state.taskMode;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+  }
+  function setTaskMode(mode) {
+    if (!TASK_MODES.some(item => item.id === mode)) return;
+    state.taskMode = mode;
+    state.researchTaskActive = ['web_search','deep_research'].includes(mode);
+    closeToolsMenu();
+    if (['web_search','deep_research'].includes(mode)) {
+      state.workbenchCollapsed = false;
+      state.workbenchTab = 'activity';
+      pushActivity(`${TASK_MODES.find(item=>item.id===mode).label} enabled`, 'Spaceline will search and read sources directly over HTTP; Chromium stays available for explicit browser tasks.');
+    } else if (['deep_think','architect','build','debug','review','autonomous','file_analysis','data_analysis','plan'].includes(mode)) {
+      state.workbenchCollapsed = false;
+      state.workbenchTab = mode === 'review' ? 'review' : 'activity';
+      pushActivity(`${TASK_MODES.find(item=>item.id===mode).label} enabled`, mode === 'deep_think' ? 'Spaceline will structure the problem and show useful progress here; web browsing is used only when needed.' : 'Spaceline will follow this mode’s project and permission boundaries.');
+    } else {
+      state.workbenchTab = 'activity';
+      state.workbenchCollapsed = true;
+    }
+    $('#chatWorkspace')?.classList.toggle('workbench-collapsed', state.workbenchCollapsed);
+    saveWorkspacePreferences();
+    updateTaskModeUI();
+    refreshWorkbench();
+    if (mode === 'review' && state.selectedProject) loadGitReview(true);
+  }
+  async function loadBrowserScreenshot() {
+    const response = await fetch('/api/browser/screenshot', {headers:{'X-Spaceline-Token':TOKEN}});
+    if (!response.ok) throw new Error('Browser screenshot is not available yet.');
+    const url = URL.createObjectURL(await response.blob());
+    if (state.browserScreenshotUrl) URL.revokeObjectURL(state.browserScreenshotUrl);
+    state.browserScreenshotUrl = url;
+  }
+  async function openSpacelineBrowser(url) {
+    state.researchTaskActive = false;
+    const target = String(url || '').trim(); if (!target) return;
+    try {
+      const isUrl = /^https?:\/\//i.test(target) || /^[a-z0-9.-]+\.[a-z]{2,}(?:\/.*)?$/i.test(target);
+      pushActivity(isUrl ? 'Opening browser page' : 'Searching the web', target);
+      const endpoint = isUrl ? '/api/browser/open' : '/api/browser/search';
+      const payload = isUrl ? {url:target} : {query:target};
+      const data = await api(endpoint, {method:'POST', body:JSON.stringify(payload)});
+      state.browserData = data;
+      state.workbenchTab = 'browser'; state.workbenchCollapsed = false;
+      saveWorkspacePreferences();
+      $('#chatWorkspace')?.classList.remove('workbench-collapsed');
+      await loadBrowserScreenshot().catch(()=>{});
+      pushActivity('Browser page ready', `${data.title || data.url} · ${data.url}`);
+      updateWorkbenchTabs(); refreshWorkbench();
+    } catch (error) { pushActivity('Browser error', error.message, 'error'); toast(error.message); refreshWorkbench(); }
+  }
+  async function runBrowserCommand(command) {
+    if (state.browserCommandBusy) return;
+    state.researchTaskActive = false;
+    state.browserCommandBusy = true;
+    state.browserCommandStatus = `Running: ${String(command).slice(0,120)}`;
+    refreshWorkbench();
+    pushActivity('Browser command', command);
+    try {
+      const result = await api('/api/browser/command', {method:'POST', body:JSON.stringify({command})});
+      state.browserData = result;
+      state.browserCommandStatus = result.summary || `Completed: ${result.action || 'browser action'}`;
+      await loadBrowserScreenshot().catch(() => {});
+      pushActivity('Browser action complete', `${result.title || 'Page updated'} · ${result.url || ''}`);
+    } catch (error) {
+      state.browserCommandStatus = error.message;
+      pushActivity('Browser command blocked or failed', error.message, 'error');
+      toast(error.message);
+    } finally {
+      state.browserCommandBusy = false;
+      state.workbenchTab = 'browser'; state.workbenchCollapsed = false;
+      $('#chatWorkspace')?.classList.remove('workbench-collapsed');
+      refreshWorkbench();
+    }
+  }
+
+  async function refreshBrowserPage(options = {}) {
+    try {
+      state.browserData = await api('/api/browser/page');
+      const captureScreenshot = options.captureScreenshot ?? state.workbenchTab === 'browser';
+      if (captureScreenshot) await loadBrowserScreenshot().catch(()=>{});
+      if (state.workbenchTab === 'browser') refreshWorkbench();
+    } catch (error) { toast(error.message); }
+  }
+  function projectPreviewUrl() {
+    if (!state.selectedProject || !state.activeFile) return '';
+    const path = state.activeFile.split('/').map(encodeURIComponent).join('/');
+    return `/preview/${encodeURIComponent(state.selectedProject)}/${path}?v=${state.previewVersion}`;
+  }
+  function setEditorSaveStatus(message) {
+    const label = $('#editorSaveStatus');
+    if (label) label.textContent = message;
+  }
+  function refreshPreviewFrames() {
+    const source = projectPreviewUrl();
+    if (!source) return;
+    $$('.code-inline-preview-frame, .live-preview-frame').forEach(frame => { frame.src = source; });
+  }
+  function scheduleWorkbenchSave() {
+    clearTimeout(editorSaveTimer);
+    editorSaveTimer = setTimeout(() => saveWorkbenchEditor(false), 950);
+  }
+  async function saveWorkbenchEditor(showToast = false) {
+    const editor = $('#workbenchCodeEditor');
+    if (!editor || !state.selectedProject || !state.activeFile || state.activeDocument) return false;
+    if (editorSavePromise) return editorSavePromise;
+    const content = editor.value;
+    if (content === state.savedCodeContent) {
+      state.editorDirty = false;
+      setEditorSaveStatus('Saved');
+      return true;
+    }
+    setEditorSaveStatus('Saving…');
+    editorSavePromise = (async () => {
+      try {
+        await api('/api/file', {method:'PUT', body:JSON.stringify({project:state.selectedProject,path:state.activeFile,content})});
+        state.savedCodeContent = content;
+        state.codeContent = editor.value;
+        state.editorDirty = editor.value !== content;
+        state.previewVersion += 1;
+        setEditorSaveStatus(state.editorDirty ? 'Saving newer edits…' : 'Saved · preview updated');
+        refreshPreviewFrames();
+        pushActivity('Saved project file', state.activeFile);
+        if (showToast) toast('File saved and preview refreshed');
+        return true;
+      } catch (error) {
+        state.editorDirty = true;
+        setEditorSaveStatus('Save failed · retry');
+        if (showToast) toast(`Could not save file: ${error.message}`);
+        return false;
+      } finally {
+        editorSavePromise = null;
+        if (state.editorDirty) scheduleWorkbenchSave();
+      }
+    })();
+    return editorSavePromise;
+  }
+  async function refreshWorkbenchPreview() {
+    if (state.editorDirty) {
+      const saved = await saveWorkbenchEditor(false);
+      if (!saved) { toast('Save failed. Fix the connection and retry before previewing.'); return; }
+    }
+    state.previewVersion += 1;
+    refreshPreviewFrames();
+    toast('Preview refreshed');
+  }
+
+  function updateWorkbenchTabs() {
+    $$('[data-workbench-tab]').forEach(button => {
+      const active = button.dataset.workbenchTab === state.workbenchTab;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+  }
+  function refreshWorkbench() {
+    const body = $('#workbenchBody'); if (!body) return;
+    body.innerHTML = renderWorkbenchTab();
+    updateWorkbenchTabs();
+    bindWorkbench();
+  }
+  async function loadGitWorktrees(force = false, repaint = true) {
+    if (!state.selectedProject) {
+      state.gitWorktrees = []; state.gitWorktreesProject = null; state.gitWorktreesError = '';
+      if (repaint) refreshWorkbench();
+      return;
+    }
+    if (!force && state.gitWorktreesProject === state.selectedProject) {
+      if (repaint) refreshWorkbench();
+      return;
+    }
+    const project = state.selectedProject;
+    state.gitWorktreesLoading = true; state.gitWorktreesError = '';
+    if (repaint) refreshWorkbench();
+    try {
+      const data = await api(`/api/projects/${encodeURIComponent(project)}/worktrees`);
+      if (state.selectedProject === project) {
+        state.gitWorktrees = data.worktrees || [];
+        state.gitWorktreesProject = project;
+      }
+    } catch (error) {
+      if (state.selectedProject === project) {
+        state.gitWorktrees = []; state.gitWorktreesProject = project;
+        state.gitWorktreesError = error.message || 'Could not list Git worktrees.';
+      }
+    } finally {
+      state.gitWorktreesLoading = false;
+      if (repaint) refreshWorkbench();
+    }
+  }
+
+  async function loadGitReview(force = false) {
+    if (!state.selectedProject) { state.gitReview = null; state.gitReviewError = ''; state.gitWorktrees = []; state.gitWorktreesProject = null; refreshWorkbench(); return; }
+    if (!force && state.gitReview?.project === state.selectedProject) { refreshWorkbench(); return; }
+    state.gitReviewLoading = true; state.gitReviewError = ''; refreshWorkbench();
+    try {
+      const review = await api(`/api/projects/${encodeURIComponent(state.selectedProject)}/git-review`);
+      state.gitReview = review;
+    } catch (error) {
+      state.gitReviewError = error.message || 'Could not read the Git working tree.';
+      state.gitReview = null;
+    } finally {
+      state.gitReviewLoading = false;
+      await loadGitWorktrees(true, false);
+      refreshWorkbench();
+    }
+  }
+  async function bindWorkbench() {
+    $('#refreshGitReview')?.addEventListener('click', () => loadGitReview(true));
+    $('#refreshGitWorktrees')?.addEventListener('click', () => loadGitWorktrees(true));
+    $('#createWorktreeForm')?.addEventListener('submit', async event => {
+      event.preventDefault();
+      if (!state.selectedProject) return;
+      const input = $('#worktreeName');
+      const button = event.currentTarget.querySelector('button[type="submit"]');
+      const label = String(input?.value || '').trim();
+      if (!label) { toast('Enter a name for the isolated task workspace.'); return; }
+      if (button) button.disabled = true;
+      state.gitWorktreesLoading = true; state.gitWorktreesError = ''; refreshWorkbench();
+      try {
+        const baseProject = state.selectedProject;
+        const created = await api(`/api/projects/${encodeURIComponent(baseProject)}/worktrees`, {
+          method:'POST', body:JSON.stringify({name:label})
+        });
+        await loadProjects();
+        await loadGitWorktrees(true, false);
+        toast(`Created isolated workspace · ${created.branch}`);
+        refreshWorkbench();
+      } catch (error) {
+        state.gitWorktreesError = error.message || 'Could not create the isolated workspace.';
+        state.gitWorktreesLoading = false;
+        refreshWorkbench();
+      }
+    });
+    $$('[data-worktree-open]').forEach(button => button.addEventListener('click', async () => {
+      const project = button.dataset.worktreeOpen;
+      if (!state.projects.includes(project)) await loadProjects();
+      if (!state.projects.includes(project)) { toast('That isolated workspace is no longer available.'); return; }
+      if (state.editorDirty && !(await saveWorkbenchEditor(false))) { toast('Save the current file before switching workspaces.'); return; }
+      state.selectedProject = project;
+      state.activeFile = null; state.activeDocument = null; state.codeContent = ''; state.savedCodeContent = '';
+      state.editorDirty = false; state.files = []; state.fileSearchResults = []; state.fileSearchQuery = '';
+      state.gitReview = null; state.gitReviewError = ''; state.gitWorktreesProject = null;
+      state.workbenchTab = 'files'; state.workbenchCollapsed = false;
+      saveWorkspacePreferences();
+      await loadProjectFiles();
+      renderSidebar(); render();
+      toast(`Switched to ${project}. Use a separate chat to run an independent task here.`);
+    }));
+    $$('[data-workbench-tab]').forEach(button => button.addEventListener('click', async () => {
+      if (state.workbenchTab === 'code' && state.editorDirty) {
+        const saved = await saveWorkbenchEditor(false);
+        if (!saved) { toast('Save the current edits before switching workspace tabs.'); return; }
+      }
+      if (button.dataset.workbenchTab === 'browser') state.researchTaskActive = false;
+      state.workbenchTab = button.dataset.workbenchTab;
+      saveWorkspacePreferences();
+      if (state.workbenchTab === 'review') loadGitReview(true);
+      else if (state.workbenchTab === 'files' && state.selectedProject && !state.files.length) loadProjectFiles().then(refreshWorkbench);
+      else refreshWorkbench();
+    }));
+    $('#imageGenerateForm')?.addEventListener('submit', event => { event.preventDefault(); generateImage(); });
+    $('#imagePrompt')?.addEventListener('input', event => { state.imagePrompt = event.target.value; });
+    $('#imageAspectRatio')?.addEventListener('change', event => { state.imageAspectRatio = event.target.value; });
+    $('#imageQuality')?.addEventListener('change', event => { state.imageQuality = event.target.value; });
+    const refreshImageModelControls = () => {
+      const profile = state.profiles.find(item=>item.id===($('#imageProfile')?.value || state.imageProfileId));
+      const modelSelect = $('#imageModel');
+      const qualitySelect = $('#imageQuality');
+      if (!profile || !modelSelect || !qualitySelect) return;
+      const gemini = profile.provider === 'gemini';
+      const edenai = isEdenImageProfile(profile);
+      const aihorde = isAIHordeImageProfile(profile);
+      const remoteModels = isRemoteImageModelProfile(profile);
+      const currentModel = modelSelect.value;
+      const accountModels = remoteModels ? (state.imageModelsByProfile[profile.id] || []) : [];
+      const rows = remoteModels
+        ? accountModels.map(item => [item.id, item.name || item.id])
+        : gemini
+        ? [['gemini-3.1-flash-image','Gemini 3.1 Flash Image · balanced'],['gemini-3.1-flash-lite-image','Gemini 3.1 Flash Lite Image · 1K'],['gemini-3-pro-image','Gemini 3 Pro Image · professional']]
+        : [['gpt-image-2.5-flare','GPT Image 2.5 Flare · faster'],['gpt-image-2.5-sunburst','GPT Image 2.5 Sunburst · precision'],['gpt-image-2.6-flare','GPT Image 2.6 Flare'],['gpt-image-2.6-sunburst','GPT Image 2.6 Sunburst']];
+      modelSelect.innerHTML = rows.length
+        ? rows.map(([id,label])=>`<option value="${escapeHTML(id)}">${escapeHTML(label)}</option>`).join('')
+        : `<option value="">${remoteModels ? 'Load available image models first' : 'No image models available'}</option>`;
+      if (rows.some(([id])=>id===currentModel)) modelSelect.value = currentModel;
+      else if (rows.length) modelSelect.selectedIndex = 0;
+      state.imageModelId = modelSelect.value;
+      const lite = modelSelect.value === 'gemini-3.1-flash-lite-image';
+      const qualities = remoteModels ? [['medium','Provider default']] : lite ? [['low','Low'],['medium','Standard']] : [['low','Low'],['medium','Standard'],['high','High'],['xhigh','Ultra'],['max','Maximum']];
+      const currentQuality = qualitySelect.value;
+      qualitySelect.innerHTML = qualities.map(([id,label])=>`<option value="${id}" ${id==='medium'?'selected':''}>${label}</option>`).join('');
+      qualitySelect.disabled = remoteModels;
+      if (qualities.some(([id])=>id===currentQuality)) qualitySelect.value = currentQuality;
+      state.imageQuality = qualitySelect.value;
+      const ratioSelect = $('#imageAspectRatio');
+      if (ratioSelect) {
+        const ratios = gemini && !remoteModels ? ['1:1','3:2','2:3','16:9','9:16','4:3','3:4','4:5','5:4','21:9','1:4','4:1','1:8','8:1'] : ['1:1','3:2','2:3','16:9','9:16','4:3','3:4','4:5','5:4','21:9'];
+        const currentRatio = ratios.includes(ratioSelect.value) ? ratioSelect.value : '1:1';
+        ratioSelect.innerHTML = ratios.map(value=>`<option value="${value}">${value}</option>`).join('');
+        ratioSelect.value = currentRatio;
+        state.imageAspectRatio = currentRatio;
+      }
+    };
+    $('#imageProfile')?.addEventListener('change', event => {
+      state.imageProfileId = event.target.value;
+      refreshImageModelControls();
+      const selected = state.profiles.find(item=>item.id===state.imageProfileId);
+      if (isRemoteImageModelProfile(selected) && !state.imageModelStatusByProfile[selected.id]) loadRemoteImageModels(selected.id);
+    });
+    $('#imageModel')?.addEventListener('change', event => { state.imageModelId = event.target.value; refreshImageModelControls(); });
+    $$('[data-refresh-image-models]').forEach(button => button.addEventListener('click', () => loadRemoteImageModels(button.dataset.refreshImageModels, true)));
+    const initialImageProfile = state.profiles.find(item=>item.id===state.imageProfileId);
+    if (isRemoteImageModelProfile(initialImageProfile) && !state.imageModelStatusByProfile[initialImageProfile.id]) loadRemoteImageModels(initialImageProfile.id);
+    $('#refreshImageHistory')?.addEventListener('click', async () => {
+      const button = $('#refreshImageHistory'); if (button) button.disabled = true;
+      await loadGeneratedImages(); refreshImageStudioView();
+    });
+    $('#imageGallery')?.addEventListener('click', async event => {
+      const button = event.target.closest('[data-image-delete]');
+      if (!button) return;
+      const filename = button.dataset.imageDelete;
+      if (!filename || !window.confirm('Delete this generated image from your Spaceline workspace?')) return;
+      button.disabled = true;
+      try {
+        await api(`/api/images/${encodeURIComponent(filename)}`, {method:'DELETE'});
+        const old = state.generatedImages.find(item=>item.filename===filename);
+        if (old?.previewUrl) URL.revokeObjectURL(old.previewUrl);
+        state.generatedImages = state.generatedImages.filter(item=>item.filename!==filename);
+        refreshImageStudioView(); toast('Image deleted from Spaceline.');
+      } catch (error) { button.disabled = false; toast(`Could not delete image: ${error.message}`); }
+    });
+    $('#workbenchBrowserForm')?.addEventListener('submit', event => {
+      event.preventDefault(); const value = $('#workbenchBrowserUrl')?.value.trim(); if (value) openSpacelineBrowser(value);
+    });
+    $('#browserCommandForm')?.addEventListener('submit', event => {
+      event.preventDefault();
+      const input = $('#browserCommandInput');
+      const command = input?.value.trim() || '';
+      if (!command) { toast('Enter a browser command first.'); return; }
+      input.value = '';
+      runBrowserCommand(command);
+    });
+    $$('[data-browser-url]').forEach(button => button.addEventListener('click', () => openSpacelineBrowser(button.dataset.browserUrl)));
+    $('#readBrowserPage')?.addEventListener('click', refreshBrowserPage);
+    $('#refreshWorkbench')?.addEventListener('click', () => {
+      if (state.workbenchTab === 'browser' && state.browserData) refreshBrowserPage();
+      else if (state.workbenchTab === 'files') loadProjectFiles().then(refreshWorkbench);
+      else refreshWorkbench();
+    });
+    $('#collapseWorkbench')?.addEventListener('click', () => {
+      state.workbenchCollapsed = true; saveWorkspacePreferences(); $('#chatWorkspace')?.classList.add('workbench-collapsed');
+    });
+    $('#toggleWorkbench')?.addEventListener('click', () => {
+      state.workbenchCollapsed = !state.workbenchCollapsed;
+      $('#chatWorkspace')?.classList.toggle('workbench-collapsed', state.workbenchCollapsed);
+      $('#toggleWorkbench').textContent = state.workbenchCollapsed ? '◧' : '▤';
+      saveWorkspacePreferences();
+    });
+    $('#previewOpenCode')?.addEventListener('click', () => { state.workbenchTab='code'; refreshWorkbench(); });
+    $('#refreshLivePreview')?.addEventListener('click', refreshWorkbenchPreview);
+    $('#refreshCodePreview')?.addEventListener('click', refreshWorkbenchPreview);
+    $('#previewFromCode')?.addEventListener('click', async () => {
+      if (state.editorDirty && !(await saveWorkbenchEditor(false))) { toast('Save failed. Preview was not switched.'); return; }
+      state.workbenchTab='preview'; saveWorkspacePreferences(); refreshWorkbench();
+    });
+    $('#workbenchCodeEditor')?.addEventListener('input', event => {
+      state.codeContent = event.target.value;
+      state.editorDirty = state.codeContent !== state.savedCodeContent;
+      setEditorSaveStatus(state.editorDirty ? 'Unsaved changes · auto-save on pause' : 'Saved');
+      if (state.editorDirty) scheduleWorkbenchSave();
+      else clearTimeout(editorSaveTimer);
+    });
+    $('#askAboutActiveDocument')?.addEventListener('click', askAboutActiveDocument);
+    $('#projectFileSearchForm')?.addEventListener('submit', async event => {
+      event.preventDefault();
+      const query = $('#projectFileSearchInput')?.value.trim() || '';
+      if (!state.selectedProject) { toast('Select a project first.'); return; }
+      if (query.length < 2) { toast('Enter at least two characters to search.'); return; }
+      state.fileSearchQuery = query;
+      try {
+        const result = await api(`/api/files/search?project=${encodeURIComponent(state.selectedProject)}&q=${encodeURIComponent(query)}&limit=30`);
+        state.fileSearchResults = result.matches || [];
+        refreshWorkbench();
+        toast(`${state.fileSearchResults.length} matching passages found`);
+      } catch(error) { toast(error.message); }
+    });
+    $$('[data-file-match]').forEach(button => button.addEventListener('click', async () => {
+      await openProjectFile(button.dataset.fileMatch);
+      state.workbenchTab = 'code'; refreshWorkbench();
+    }));
+    $('#openCodeWorkspace')?.addEventListener('click', async () => {
+      state.mode = 'code'; await loadProjects();
+      if (!state.selectedProject && state.projects.length) state.selectedProject = state.projects[0];
+      await loadProjectFiles(); state.view='projects'; renderSidebar(); render();
+    });
+    $('#saveWorkbenchCode')?.addEventListener('click', () => saveWorkbenchEditor(true));
+    $('#chooseWorkbenchProject')?.addEventListener('click', async () => {
+      if (state.editorDirty && !(await saveWorkbenchEditor(false))) { toast('Save your current edits before changing projects.'); return; }
+      await loadProjects();
+      const chosen = prompt(`Choose a project:
+${state.projects.join('\n')}`, state.selectedProject || state.projects[0] || '');
+      if (!chosen || !state.projects.includes(chosen)) return;
+      state.selectedProject = chosen; state.gitReview = null; state.gitReviewError = ''; state.activeFile = null; state.activeDocument = null; state.codeContent = ''; state.savedCodeContent = ''; state.editorDirty = false; state.fileSearchResults = []; state.fileSearchQuery = '';
+      const contextSelect = $('#projectContext'); if (contextSelect) contextSelect.value = chosen;
+      await loadProjectFiles(); if (state.workbenchTab === 'review') await loadGitReview(true); else refreshWorkbench();
+    });
+    $$('.workbench-file').forEach(button => button.addEventListener('click', async () => {
+      const file = state.files.find(item=>item.path===button.dataset.workbenchFile);
+      if (file?.type === 'folder') return;
+      await openProjectFile(button.dataset.workbenchFile);
+      state.workbenchTab = 'code'; refreshWorkbench();
+    }));
+  }
+
+  function bindChat() {
+    const form = $('#composerForm'); if (!form) return;
+    bindCopyControls($('#chatScroll'));
+    normalizeMessageCopyActions($('#messages'));
+    watchMessageCopyActions();
+    $('#deleteCurrentChat')?.addEventListener('click', () => deleteChat(state.activeChatId));
+    $('#openBrowserWorkbench')?.addEventListener('click', () => { state.researchTaskActive=false; state.workbenchTab='browser'; state.workbenchCollapsed=false; saveWorkspacePreferences(); refreshWorkbench(); $('#chatWorkspace')?.classList.remove('workbench-collapsed'); });
+    $$('.task-mode').forEach(button => button.addEventListener('click', () => setTaskMode(button.dataset.taskMode)));
+    $('#taskModeSearch')?.addEventListener('input', event => {
+      const query = String(event.target.value || '').trim().toLowerCase();
+      $$('.task-mode').forEach(button => { button.hidden = Boolean(query) && !button.dataset.modeSearch.includes(query); });
+    });
+    $$('[data-quick-task-mode]').forEach(button => button.addEventListener('click', () => setTaskMode(button.dataset.quickTaskMode)));
+    $('#openToolsMenu')?.addEventListener('click', () => toggleToolsMenu());
+    $('#activeTaskMode')?.addEventListener('click', () => toggleToolsMenu());
+    $$('[data-tool-action]').forEach(button => button.addEventListener('click', async () => {
+      const action = button.dataset.toolAction;
+      closeToolsMenu();
+      if (action === 'attach_files') { $('#composerFileInput')?.click(); return; }
+      if (action === 'image_generate') { state.workbenchTab='images'; state.workbenchCollapsed=false; saveWorkspacePreferences(); render(); return; }
+      if (action === 'browser' || action === 'templates') {
+        state.workbenchTab = 'browser'; state.workbenchCollapsed = false;
+        saveWorkspacePreferences();
+        render();
+        if (action === 'templates') toast('Choose a UI, motion or prompt reference in the Browser panel.');
+        return;
+      }
+      if (['code','preview','files'].includes(action)) { selectWorkbenchTool(action); return; }
+      if (action === 'skills') { await loadSkills(); openCustomizeTab('skills'); return; }
+      if (action === 'plugins') { openCustomizeTab('plugins'); return; }
+      if (action === 'connectors') { openCustomizeTab('connectors'); return; }
+      if (action === 'providers') { openCustomizeTab('providers'); return; }
+    }));
+    $('#composerFileInput')?.addEventListener('change', async event => {
+      const allowed = /\.(txt|md|markdown|json|csv|html?|css|js|jsx|ts|tsx|py|java|c|cpp|h|sql|ya?ml|toml|xml|log|sh|ps1|bat|ini|docx|xlsx|pptx|pdf|tsv)$/i;
+      const incoming = [...(event.target.files || [])];
+      let total = state.attachments.reduce((sum, file) => sum + file.content.length, 0);
+      for (const file of incoming) {
+        if (state.attachments.length >= 3) { toast('Attach up to 3 files per message.'); break; }
+        if (!allowed.test(file.name)) { toast(`${file.name}: this file type is not supported yet.`); continue; }
+        if (file.size > 20 * 1024 * 1024) { toast(`${file.name}: files must be 20 MB or smaller.`); continue; }
+        try {
+          let text = '';
+          if (/\.(pdf|docx|xlsx|pptx|csv|tsv)$/i.test(file.name)) {
+            const form = new FormData(); form.append('file', file, file.name);
+            const response = await fetch('/api/files/analyze-upload', {method:'POST', headers:{'X-Spaceline-Token':TOKEN}, body:form});
+            const result = await response.json().catch(()=>({}));
+            if (!response.ok) throw new Error(result.detail || `Could not extract ${file.name}.`);
+            text = result.content || '';
+            if (result.warnings?.length) toast(`${file.name}: ${result.warnings.join(' ')}`);
+            if (!text.trim()) { toast(`${file.name}: no selectable text found. Scanned PDFs/images need OCR or vision.`); continue; }
+          } else {
+            if (file.size > 250 * 1024) { toast(`${file.name}: text attachments are limited to 250 KB.`); continue; }
+            text = await file.text();
+          }
+          text = text.slice(0, 14000);
+          if (total + text.length > 15000) { toast('Combined attachment text must be 15 KB or smaller.'); break; }
+          state.attachments.push({name:file.name, content:text}); total += text.length;
+        } catch (error) { toast(`${file.name}: ${error.message || 'could not read file'}`); }
+      }
+      $('#attachmentList').innerHTML = renderAttachmentChips();
+      event.target.value = '';
+    });
+    $('#attachmentList')?.addEventListener('click', event => {
+      const remove = event.target.closest('[data-remove-attachment]'); if (!remove) return;
+      state.attachments.splice(Number(remove.dataset.removeAttachment), 1);
+      $('#attachmentList').innerHTML = renderAttachmentChips();
+    });
+    bindWorkbench();
+    bindModelUsagePanel();
+    $('#profileSelect')?.addEventListener('change', async event => {
+      await setActiveProfile(event.target.value);
+      render();
+    });
+    $('#openModelPicker')?.addEventListener('click', () => {
+      const profile = selectedProfile(); if (profile) discoverModels(profile.id);
+    });
+    $('#projectContext')?.addEventListener('change', async event => {
+      state.selectedProject = event.target.value || null;
+      state.activeFile = null; state.codeContent = '';
+      await loadProjectFiles(); refreshWorkbench();
+    });
+    form.addEventListener('submit', event => { event.preventDefault(); sendMessage(); });
+    $('#composerInput').addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); }
+    });
+    $$('.suggestion-card').forEach(button => button.addEventListener('click', () => {
+      $('#composerInput').value = button.dataset.prompt || ''; persistComposerDraft($('#composerInput').value); $('#composerInput').focus();
+    }));
+    const input = $('#composerInput');
+    input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 220) + 'px'; persistComposerDraft(input.value); });
+    const scroll = $('#chatScroll'); if (scroll) scroll.scrollTop = scroll.scrollHeight;
+  }
+  function openWorkbenchForTask(prompt) {
+    const text = String(prompt || '').toLowerCase();
+    const selectedResearchMode = ['web_search','deep_research'].includes(state.taskMode);
+    const browserCommand = /\b(open|show|display|launch|switch to|bring up|use)\s+(?:the\s+)?(?:browser|chromium|chrome|website|site|url)\b/.test(text);
+    const explicitBrowserNegation = /\b(?:do not|don't|never|avoid)\s+(?:open|show|launch|use)\s+(?:the\s+)?(?:browser|chromium|chrome)\b/.test(text);
+    const explicitlyOpenBrowser = browserCommand && !explicitBrowserNegation;
+    const research = !explicitlyOpenBrowser && (selectedResearchMode || /\b(search the web|search web|search online|web search|browse online|look up online|research online|research the web|deep research|in-depth research|comprehensive research|current sources|latest information|find sources)\b/.test(text));
+    state.researchTaskActive = research;
+    const code = state.mode === 'code' || /\b(build|create|implement|edit|fix|change|refactor|write code|add feature|run test|debug)\b/.test(text) && Boolean($('#projectContext')?.value || state.selectedProject);
+    if (explicitlyOpenBrowser) { state.workbenchTab = 'browser'; state.workbenchCollapsed = false; }
+    else if (research || state.taskMode === 'deep_think' || code) { state.workbenchTab = 'activity'; state.workbenchCollapsed = false; }
+    else { state.workbenchCollapsed = true; }
+    saveWorkspacePreferences();
+    $('#chatWorkspace')?.classList.toggle('workbench-collapsed', state.workbenchCollapsed);
+  }
+
+  async function generateImage() {
+    if (state.imageGenerating) return;
+    const prompt = $('#imagePrompt')?.value.trim() || '';
+    const profileId = $('#imageProfile')?.value || state.imageProfileId || state.profiles.find(profile=>profile.enabled !== false && supportsImageGeneration(profile))?.id;
+    const imageProfile = state.profiles.find(profile=>profile.id===profileId);
+    if (!prompt) { toast('Write an image prompt first.'); return; }
+    if (!profileId || !imageProfile || !supportsImageGeneration(imageProfile)) { toast('Enable an OpenAI, Google Gemini, Eden AI or free AI Horde image connection first.'); return; }
+    if (isRemoteImageModelProfile(imageProfile) && state.imageModelStatusByProfile[profileId] !== 'ready') { toast('Load the active image models for this provider first.'); return; }
+    const model = $('#imageModel')?.value || (imageProfile.provider === 'gemini' ? 'gemini-3.1-flash-image' : imageProfile.provider === 'edenai' || imageProfile.provider === 'aihorde' ? '' : 'gpt-image-2.5-flare');
+    if (!model) { toast('Choose an image model before generating.'); return; }
+    const quality = $('#imageQuality')?.value || 'medium';
+    const aspectRatio = $('#imageAspectRatio')?.value || '1:1';
+    state.imageGenerating = true; refreshWorkbench();
+    const providerLabel = isAIHordeImageProfile(imageProfile) ? 'AI Horde (community workers)' : isEdenImageProfile(imageProfile) ? 'Eden AI' : imageProfile.provider === 'gemini' ? 'Gemini' : 'OpenAI';
+    pushActivity('Image generation started', `Sending the prompt to ${providerLabel} · ${model}. Separate usage charges may apply.`);
+    try {
+      const result = await api('/api/images/generate', {method:'POST', body:JSON.stringify({
+        profile_id:profileId, prompt, model, aspect_ratio:aspectRatio, quality
+      })});
+      const response = await fetch(result.url, {headers:{'X-Spaceline-Token':TOKEN}});
+      if (!response.ok) throw new Error('Image was saved, but Spaceline could not load its preview. Use Refresh to reload the gallery.');
+      const previewUrl = URL.createObjectURL(await response.blob());
+      state.generatedImages.unshift({...result, previewUrl});
+      state.generatedImages.slice(100).forEach(item => { if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); });
+      state.generatedImages = state.generatedImages.slice(0,100);
+      pushActivity('Image generated', `${result.model} · ${result.aspect_ratio} · ${result.quality}`);
+      toast('Image generated and saved to your workspace.');
+    } catch (error) {
+      if (error.sessionExpired) {
+        // app_token is intentionally regenerated on each server start. A stale tab must
+        // refresh to receive the new token; never retry the image request automatically.
+        try {
+          localStorage.setItem('spaceline.imageSessionRecovery.v1', JSON.stringify({
+            prompt, profileId, model, aspectRatio, quality, saved_at: Date.now()
+          }));
+        } catch (_) { /* private browsing/storage limits: current UI state remains visible */ }
+        pushActivity('Spaceline session expired', 'The server session changed. Refresh Spaceline before generating again.', 'error');
+        toast('Spaceline session expired. Refreshing the workspace…');
+        setTimeout(() => window.location.reload(), 150);
+        return;
+      }
+      pushActivity('Image generation failed', error.message, 'error'); toast(error.message);
+    }
+    finally { state.imageGenerating = false; refreshImageStudioView(); }
+  }
+
+  async function sendMessage() {
+    const input = $('#composerInput'); if (!input) return;
+    const prompt = input.value.trim();
+    const attached = [...state.attachments];
+    if (!prompt && !attached.length) return;
+    const content = prompt + attached.map(file => `\n\n[Attached file: ${file.name}]\n\`\`\`\n${file.content}\n\`\`\``).join('');
+    if (content.length > 19500) { toast('Message plus attachments is too large. Reduce the prompt or attached file contents.'); return; }
+    if (!state.profiles.length) { toast('Add an API provider in Customize first'); navigate('customize'); return; }
+    // The persisted, explicitly approved selection is authoritative. Never trust a transient DOM option.
+    const profileId = state.activeProfileId;
+    const chosenProfile = state.profiles.find(item => item.id === profileId && item.enabled !== false);
+    if (!chosenProfile) { toast('Choose an enabled provider connection first.'); return; }
+    if (!chosenProfile.model) { toast('Choose a model for this connection first. Opening the model picker.'); await discoverModels(chosenProfile.id); return; }
+    const project = $('#projectContext')?.value || null;
+    persistComposerDraft('');
+    state.liveAnswer = '';
+    state.actualUsedModel = {profile_id:chosenProfile.id, provider:chosenProfile.provider, model:chosenProfile.model};
+    openWorkbenchForTask(prompt);
+    input.value = ''; input.style.height = '54px';
+    state.attachments = [];
+    state.sendInProgress = true;
+    renderSidebar();
+    const currentDeleteButton = $('#deleteCurrentChat'); if (currentDeleteButton) currentDeleteButton.disabled = true;
+    try {
+      if (!state.activeChatId) {
+        const created = await api('/api/chats', {method:'POST', body:JSON.stringify({title:'New chat', profile_id:profileId})});
+        state.activeChatId = created.id; state.activeChat = created;
+      }
+      const chatScroll = $('#chatScroll');
+      if (!state.activeChat.messages) state.activeChat.messages = [];
+      state.activeChat.messages.push({role:'user',content});
+      renderSidebar(); render();
+      const container = $('#messages');
+      if (container) {
+        const row = document.createElement('article'); row.className = 'message-row assistant';
+        row.innerHTML = `<div class="message-avatar">N</div><div class="message-body"><div class="message-meta">Spaceline</div><div class="spaceline-thinking-hud" id="spacelineThinkingHUD" role="status" aria-live="polite"><canvas id="spacelineThinkingCanvas" width="36" height="36" aria-hidden="true"></canvas><span class="thinking-word">Thinking</span><span class="spaceline-thinking-status" id="spacelineThinkingStatus">…</span></div><div class="message-content" id="liveAnswer"><span class="typing-caret"></span></div><div class="message-note-actions" id="liveNoteAction" hidden><button type="button" class="copy-note-button" data-copy-live-note title="Copy note" aria-label="Copy note">${NOTE_COPY_ICON}</button></div></div>`;
+        container.appendChild(row);
+        startThinkingHUD();
+        $('#chatScroll').scrollTop = $('#chatScroll').scrollHeight;
+      }
+      const response = await fetch(`/api/chats/${encodeURIComponent(state.activeChatId)}/messages`, {
+        method:'POST', headers:{'Content-Type':'application/json','X-Spaceline-Token':TOKEN},
+        body:JSON.stringify({content, profile_id:profileId, model:chosenProfile.model, project, mode:state.mode, task_mode:state.taskMode, context_limit:contextLimitForProfile(chosenProfile)})
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({})); throw new Error(error.detail || `AI request failed (${response.status})`);
+      }
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; let answer = ''; let completed = false; let streamError = '';
+      const live = $('#liveAnswer');
+      while (true) {
+        const {value, done} = await reader.read(); if (done) break;
+        buffer += decoder.decode(value, {stream:true});
+        const chunks = buffer.split('\n\n'); buffer = chunks.pop() || '';
+        for (const part of chunks) {
+          const line = part.split('\n').find(x => x.startsWith('data:'));
+          if (!line) continue;
+          try {
+            const data = JSON.parse(line.slice(5).trim());
+            if (data.status) {
+              setThinkingStatus(data.status); pushActivity('Agent action', data.status);
+              if (data.tool && data.tool.startsWith('browser_')) {
+                // Browser tools are only exposed for explicit interactive-browser
+                // requests. Research uses web_* HTTP tools and never reaches here.
+                state.researchTaskActive = false;
+                state.workbenchTab='browser'; state.workbenchCollapsed=false;
+                $('#chatWorkspace')?.classList.remove('workbench-collapsed');
+                if (data.summary) await refreshBrowserPage({captureScreenshot:true});
+              }
+              if (data.tool === 'project_write_file' && data.path && project) {
+                state.workbenchTab='code'; state.workbenchCollapsed=false; state.activeFile=data.path;
+                $('#chatWorkspace')?.classList.remove('workbench-collapsed');
+                await loadProjectFiles();
+                const savedFile = await api(`/api/file?project=${encodeURIComponent(project)}&path=${encodeURIComponent(data.path)}`).catch(()=>null);
+                if (savedFile) state.codeContent=savedFile.content || '';
+                refreshWorkbench();
+              }
+              if (live && !answer) live.innerHTML = '<span class="typing-caret"></span>';
+            }
+            if (data.delta) { setThinkingStatus('Responding'); answer += data.delta; state.liveAnswer = answer; if (live) live.innerHTML = renderMarkdown(answer) + '<span class="typing-caret"></span>'; $('#chatScroll').scrollTop = $('#chatScroll').scrollHeight; }
+            if (data.error) { completed = true; streamError = data.error; pushActivity('Task error', streamError, 'error'); if (live) live.innerHTML = renderMarkdown(answer) + `<div class="stream-error">${escapeHTML(streamError)}</div>`; }
+            if (data.done) {
+              completed = true;
+              if (data.profile_id && data.model) state.actualUsedModel = {profile_id:data.profile_id,provider:data.provider,model:data.model};
+            }
+          } catch (_) { /* Ignore incomplete or malformed stream frames. */ }
+        }
+      }
+      if (!answer && !completed) throw new Error('The provider returned an empty response.');
+      finishThinkingHUD();
+      if (live && !streamError) live.innerHTML = renderMarkdown(answer || (completed ? '' : 'No response received.'));
+      const liveNoteAction = $('#liveNoteAction');
+      if (liveNoteAction) liveNoteAction.hidden = !String(answer || '').trim();
+      const actual = state.actualUsedModel;
+      pushActivity('Response complete', `${actual?.provider || selectedProfile()?.provider || 'Provider'} / ${actual?.model || selectedProfile()?.model || 'Selected model'} · ${state.taskMode.replace('_',' ')}`);
+      const data = await api(`/api/chats/${encodeURIComponent(state.activeChatId)}`);
+      state.activeChat = data; await refreshChats(); renderSidebar();
+      if (data.messages?.length && !streamError) {
+        const messagesEl = $('#messages');
+        if (messagesEl) { messagesEl.innerHTML = data.messages.map(renderMessage).join(''); normalizeMessageCopyActions(messagesEl); }
+      }
+      if (streamError) toast(streamError);
+      refreshModelUsage();
+    } catch (error) {
+      finishThinkingHUD();
+      pushActivity('Request failed', error.message, 'error');
+      toast(error.message);
+      if (state.activeChatId) {
+        try { state.activeChat = await api(`/api/chats/${encodeURIComponent(state.activeChatId)}`); render(); }
+        catch (_) { const live = $('#liveAnswer'); if (live) live.innerHTML += `<div class="stream-error">${escapeHTML(error.message)}</div>`; }
+      } else { const live = $('#liveAnswer'); if (live) live.innerHTML += `<div class="stream-error">${escapeHTML(error.message)}</div>`; }
+    } finally {
+      state.sendInProgress = false;
+      renderSidebar();
+      const currentDeleteButton = $('#deleteCurrentChat'); if (currentDeleteButton) currentDeleteButton.disabled = false;
+    }
+  }
+  async function openChat(id) {
+    persistComposerDraft($('#composerInput')?.value || '');
+    try {
+      const conversation = await api(`/api/chats/${encodeURIComponent(id)}`);
+      const savedProfile = state.profiles.find(item => item.id === conversation.profile_id && item.enabled !== false) || null;
+      const currentProfile = selectedProfile();
+      if (savedProfile && conversation.model && savedProfile.model && conversation.model !== savedProfile.model) {
+        const originalModelProfile = {...savedProfile, model: conversation.model};
+        const approved = await confirmModelSwitch(currentProfile, originalModelProfile,
+          `This conversation was last used with ${conversation.model}, but its saved connection now points to ${savedProfile.model}. Approving restores the conversation's original model on this connection. Keeping the current model opens the chat without changing your selection.`);
+        if (approved) {
+          await api(`/api/providers/${encodeURIComponent(savedProfile.id)}`, {method:'PUT', body:JSON.stringify({...savedProfile, model:conversation.model, confirm_model_switch:true, enabled:savedProfile.enabled!==false, auth_mode:savedProfile.auth_mode || 'bearer', key_ids:savedProfile.key_ids || [savedProfile.key_id].filter(Boolean)})});
+          await loadProviders();
+          const restoredProfile = state.profiles.find(item => item.id === savedProfile.id && item.enabled !== false) || null;
+          if (restoredProfile && restoredProfile.id !== state.activeProfileId) await setActiveProfile(restoredProfile.id, true);
+          toast(`Restored ${conversation.model} for this conversation`);
+        } else if (savedProfile.id !== state.activeProfileId) {
+          toast(`Opening with your currently selected model. This chat was last used with ${conversation.model}.`);
+        }
+      } else if (savedProfile && savedProfile.id !== currentProfile?.id) {
+        const approved = await confirmModelSwitch(currentProfile, savedProfile,
+          'This conversation was previously used with a different connection. Approving will make that connection active; declining keeps your current model selected.');
+        if (approved) await setActiveProfile(savedProfile.id, true);
+      }
+      state.activeChat = conversation;
+      state.activeChatId = id;
+      state.view = 'chat'; state.mode = 'cowork'; state.taskMode = 'chat'; state.workbenchTab = 'activity'; state.workbenchCollapsed = true; saveWorkspacePreferences();
+      if (savedProfile && savedProfile.id !== state.activeProfileId) toast('Conversation opened. Your currently selected model was kept.');
+      renderSidebar(); render();
+    } catch (error) { toast(error.message); }
+  }
+
+  // --- Search -------------------------------------------------------------
+  function renderSearch() {
+    return `<div class="page-shell"><h1 class="page-title">Search your workspace</h1><p class="page-desc">Find conversations by title or anything you remember saying.</p><div class="field"><input id="chatSearch" placeholder="Search chats…" value="${escapeHTML(state.search)}"></div><div style="height:18px"></div><div id="searchResults">${renderSearchResults()}</div></div>`;
+  }
+  function renderSearchResults() {
+    const q = state.search.toLowerCase(); const list = state.chats.filter(c => !q || `${c.title} ${c.preview || ''}`.toLowerCase().includes(q));
+    return list.length ? `<div class="artifact-list">${list.map(c => `<div class="artifact-row"><button type="button" class="artifact-open" data-chat-open="${escapeHTML(c.id)}"><span class="artifact-symbol">◦</span><span class="artifact-copy"><strong>${escapeHTML(c.title || 'New chat')}</strong><span>${escapeHTML(c.preview || 'Conversation')}</span></span></button><button type="button" class="chat-delete search-chat-delete" data-chat-delete="${escapeHTML(c.id)}" aria-label="Delete chat" title="Delete chat" ${state.sendInProgress && c.id === state.activeChatId ? 'disabled' : ''}>Delete</button></div>`).join('')}</div>` : '<div class="empty-panel">No matching conversations yet.</div>';
+  }
+  async function deleteChat(id) {
+    if (!id) return;
+    if (state.sendInProgress && id === state.activeChatId) { toast('Wait for the response to finish before deleting this chat.'); return; }
+    const chat = state.chats.find(item => item.id === id) || (state.activeChat?.id === id ? state.activeChat : null);
+    const title = chat?.title || 'this conversation';
+    if (!window.confirm(`Delete this conversation and all of its messages?\n\n${title}\n\nThis cannot be undone.`)) return;
+    try {
+      const result = await api(`/api/chats/${encodeURIComponent(id)}`, {method:'DELETE'});
+      if (!result.deleted) throw new Error('This conversation was not found or was already deleted.');
+      state.chats = state.chats.filter(item => item.id !== id);
+      if (state.activeChatId === id) { state.activeChatId = null; state.activeChat = null; state.attachments = []; }
+      renderSidebar();
+      if (state.view === 'search') render();
+      else if (state.view === 'chat' && !state.activeChatId) render();
+      toast('Chat deleted');
+    } catch (error) { toast(`Could not delete chat: ${error.message}`); }
+  }
+  function bindSearch() {
+    $('#chatSearch')?.addEventListener('input', event => { state.search = event.target.value; $('#searchResults').innerHTML = renderSearchResults(); });
+    $('#searchResults')?.addEventListener('click', event => {
+      const deleteButton = event.target.closest('[data-chat-delete]');
+      if (deleteButton) { deleteChat(deleteButton.dataset.chatDelete); return; }
+      const button = event.target.closest('[data-chat-open]'); if (button) openChat(button.dataset.chatOpen);
+    });
+  }
+
+  // --- Projects / code workspace -----------------------------------------
+  function renderProjects() {
+    const projectOptions = state.projects.map(p => `<option value="${escapeHTML(p)}" ${p === state.selectedProject ? 'selected' : ''}>${escapeHTML(p)}</option>`).join('');
+    const files = state.files.map(item => `<button class="file-item ${item.path === state.activeFile ? 'active' : ''}" data-file="${escapeHTML(item.path)}"><span>${item.type === 'folder' ? '▱' : '◇'}</span><span class="file-name">${escapeHTML(item.path)}</span></button>`).join('');
+    const title = state.activeFile || 'Choose a file';
+    return `<div class="project-layout"><aside class="project-rail"><div class="row-between" style="padding:0 6px 10px"><h2>PROJECT FILES</h2><button class="icon-button small" id="newProject" title="New project">＋</button></div>
+      <select class="project-select" id="projectSelect"><option value="">Select project</option>${projectOptions}</select>
+      <div id="fileList">${files || '<div class="quiet-note">Select a project to see its files.</div>'}</div>
+      <div style="display:flex;gap:6px;margin:12px 5px"><button class="button subtle" id="newFile">+ File</button><button class="button subtle" id="newFolder">+ Folder</button></div>
+      </aside><section class="code-panel"><div class="code-toolbar"><strong>${escapeHTML(title)}</strong><div style="display:flex;gap:7px"><button class="button subtle" id="openInExplorer">Open folder</button><button class="button subtle" id="openInVSCode">VS Code</button><button class="button" id="previewFile" ${!state.activeFile || !/\.html?$/i.test(state.activeFile) ? 'disabled' : ''}>Preview</button><button class="button primary" id="saveFile" ${!state.activeFile || state.activeDocument ? 'disabled' : ''}>Save</button></div></div>
+      ${state.activeDocument ? `${renderDocumentPreview()}<div style="padding:10px 0"><button type="button" class="button primary" id="askAboutActiveDocument">Ask AI about this file</button></div>` : `<textarea class="code-editor" id="codeEditor" spellcheck="false" placeholder="Open a project file to edit it…" ${!state.activeFile ? 'disabled' : ''}>${escapeHTML(state.codeContent)}</textarea>`}
+      <div class="terminal-panel"><div class="terminal-head"><strong>TERMINAL · PROJECT ROOT</strong><div class="terminal-head-actions"><span style="font-size:10px;color:#829186">Local process</span><button type="button" class="copy-action" id="copyTerminalOutput">Copy output</button></div></div><div class="terminal-output" id="terminalOutput">Terminal is ready. Commands run with your Windows user permissions and are not sandboxed.</div><form class="terminal-command" id="terminalForm"><input id="terminalInput" placeholder="python main.py  ·  npm run dev  ·  dir"><button class="button" type="submit">Run</button></form></div></section></div>`;
+  }
+  async function bindProjects() {
+    $('#projectSelect')?.addEventListener('change', async event => {
+      if (state.editorDirty && !(await saveProjectFile())) { event.target.value = state.selectedProject || ''; return; }
+      state.selectedProject = event.target.value || null; state.activeFile = null; state.activeDocument = null; state.codeContent = ''; state.savedCodeContent = ''; state.editorDirty = false; await loadProjectFiles(); render();
+    });
+    $$('#fileList [data-file]').forEach(button => button.addEventListener('click', () => openProjectFile(button.dataset.file)));
+    $('#newProject')?.addEventListener('click', () => openProjectModal());
+    $('#newFile')?.addEventListener('click', () => createProjectPath('file'));
+    $('#newFolder')?.addEventListener('click', () => createProjectPath('folder'));
+    $('#saveFile')?.addEventListener('click', saveProjectFile);
+    $('#copyTerminalOutput')?.addEventListener('click', event => copyWithFeedback($('#terminalOutput')?.textContent || '', event.currentTarget));
+    bindCopyControls($('#terminalOutput'));
+    $('#askAboutActiveDocument')?.addEventListener('click', askAboutActiveDocument);
+    $('#previewFile')?.addEventListener('click', previewProjectFile);
+    $('#openInExplorer')?.addEventListener('click', () => state.selectedProject ? toast(`Project folder: ${state.projectsRoot || 'Documents\\Spaceline'}\\${state.selectedProject}`) : toast('Select a project first'));
+    $('#terminalForm')?.addEventListener('submit', runTerminalCommand);
+    if (state.selectedProject && !state.files.length) { loadProjectFiles().then(() => { if (state.view === 'projects') render(); }); }
+    if (state.selectedProject && state.activeFile && !state.activeDocument) $('#codeEditor')?.addEventListener('input', event => { state.codeContent = event.target.value; state.editorDirty = event.target.value !== state.savedCodeContent; });
+  }
+  async function loadProjectFiles() {
+    if (!state.selectedProject) { state.files = []; return; }
+    try { const data = await api(`/api/files?project=${encodeURIComponent(state.selectedProject)}`); state.files = data.files || []; }
+    catch (error) { state.files = []; toast(error.message); }
+  }
+  async function openProjectFile(path) {
+    if (!state.selectedProject) return;
+    if (state.editorDirty) {
+      const saved = state.view === 'chat' ? await saveWorkbenchEditor(false) : await saveProjectFile();
+      if (!saved) { toast('Save your current edits before opening another file.'); return; }
+    }
+    const item = state.files.find(f => f.path === path);
+    if (item?.type === 'folder') return;
+    const basename = path.split('/').pop().toLowerCase();
+    const textExt = /\.(txt|md|markdown|rst|log|json|jsonl|xml|html?|css|js|jsx|ts|tsx|py|java|c|cpp|h|hpp|cs|go|rs|sql|ya?ml|toml|ini|cfg|sh|ps1|bat|psm1|vue|svelte|php|rb|swift|kt)$/i.test(path)
+      || ['dockerfile','containerfile','makefile','gnumakefile','justfile','procfile','license','notice','authors','contributing','code_of_conduct','.gitignore','.dockerignore','.gitattributes','.editorconfig','.prettierrc','.prettierignore','.eslintignore','.watchmanconfig'].includes(basename);
+    try {
+      if (!textExt) {
+        state.activeDocument = await api(`/api/file/analyze?project=${encodeURIComponent(state.selectedProject)}&path=${encodeURIComponent(path)}`);
+        state.codeContent = state.activeDocument.content || '';
+      } else {
+        const data = await api(`/api/file?project=${encodeURIComponent(state.selectedProject)}&path=${encodeURIComponent(path)}`);
+        state.activeDocument = null; state.codeContent = data.content || '';
+      }
+      state.activeFile = path;
+      state.savedCodeContent = state.codeContent; state.editorDirty = false;
+      if (state.view === 'chat') refreshWorkbench(); else render();
+    } catch (error) { toast(error.message); }
+  }
+  async function saveProjectFile() {
+    const editor = $('#codeEditor'); if (!state.activeFile || !state.selectedProject || !editor) return false;
+    try {
+      await api('/api/file', {method:'PUT', body:JSON.stringify({project:state.selectedProject,path:state.activeFile,content:editor.value})});
+      state.codeContent = editor.value; state.savedCodeContent = editor.value; state.editorDirty = false; state.previewVersion += 1;
+      toast('File saved'); return true;
+    } catch (error) { toast(error.message); return false; }
+  }
+  async function previewProjectFile() {
+    if (!state.selectedProject || !state.activeFile) return;
+    const editor = $('#codeEditor');
+    if (editor && editor.value !== state.savedCodeContent) {
+      if (!(await saveProjectFile())) return;
+    }
+    state.workbenchTab = 'preview'; state.workbenchCollapsed = false; saveWorkspacePreferences();
+    if (state.view === 'chat') refreshWorkbench(); else { state.view = 'chat'; renderSidebar(); render(); }
+  }
+  async function createProjectPath(type) {
+    if (!state.selectedProject) { toast('Create or select a project first'); return; }
+    const path = prompt(type === 'file' ? 'New file path (example: src/main.py)' : 'New folder path (example: src)');
+    if (!path) return;
+    try { await api(type === 'file' ? '/api/file/create' : '/api/folder', {method:'POST',body:JSON.stringify({project:state.selectedProject,path})}); await loadProjectFiles(); render(); toast(type === 'file' ? 'File created' : 'Folder created'); }
+    catch (error) { toast(error.message); }
+  }
+  async function runTerminalCommand(event) {
+    event.preventDefault(); const input = $('#terminalInput'); const command = input.value.trim();
+    if (!command || !state.selectedProject) { toast('Select a project and enter a command'); return; }
+    if (!confirm('This command will run with your normal Windows account permissions. It is not sandboxed and may change or delete files. Continue?')) return;
+    const output = $('#terminalOutput'); output.textContent += `\n> ${command}\nRunning…`;
+    const body = {project:state.selectedProject,command,timeout:60}; input.value = '';
+    try { const result = await api('/api/run',{method:'POST',body:JSON.stringify(body)}); output.textContent += `\n${result.stdout || ''}${result.stderr || ''}\n[exit ${result.returncode}]`; }
+    catch (error) { output.textContent += `\n${error.message}`; }
+    output.scrollTop = output.scrollHeight;
+  }
+  function openProjectModal() {
+    showModal(`<div class="modal-head"><h2>New project</h2><button class="icon-button" data-close>×</button></div><form id="projectCreateForm"><div class="field"><label>Project name</label><input name="name" required maxlength="50" placeholder="my-ai-app"></div><p class="modal-note">A real folder will be created inside your Spaceline workspace.</p><div class="modal-actions"><button type="button" class="button subtle" data-close>Cancel</button><button class="button primary" type="submit">Create project</button></div></form>`);
+    $('#projectCreateForm').addEventListener('submit', async event => { event.preventDefault(); const name = new FormData(event.target).get('name'); try { await api('/api/projects',{method:'POST',body:JSON.stringify({name})}); await loadProjects(); state.selectedProject = name; state.files = []; state.activeFile = null; state.activeDocument = null; closeModal(); render(); await loadProjectFiles(); render(); toast('Project created'); } catch(error) { toast(error.message); } });
+  }
+
+  // --- Artifacts ----------------------------------------------------------
+  function renderArtifacts() {
+    return `<div class="page-shell"><div class="row-between"><div><h1 class="page-title">Artifacts</h1><p class="page-desc">Saved notes, prompts, snippets, and working documents from your workspace.</p></div><button class="button primary" id="newArtifact">＋ New artifact</button></div>
+      <div class="artifact-list">${state.notes.map(note => `<button class="artifact-row" data-note="${escapeHTML(note.id)}"><span class="artifact-symbol">▣</span><span class="artifact-copy"><strong>${escapeHTML(note.title)}</strong><span>${escapeHTML((note.content || '').slice(0,140))}</span></span><span style="color:#777;font-size:11px">↗</span></button>`).join('') || '<div class="empty-panel">Nothing saved yet. Create an artifact to keep useful notes and prompts in one place.</div>'}</div></div>`;
+  }
+  async function bindArtifacts() {
+    $('#newArtifact')?.addEventListener('click', () => openArtifactModal());
+    $$('#viewRoot [data-note]').forEach(button => button.addEventListener('click', () => {
+      const note = state.notes.find(n => n.id === button.dataset.note); if (note) openArtifactModal(note);
+    }));
+  }
+  async function loadNotes() { try { const data = await api('/api/notes'); state.notes = data.notes || []; } catch(error) { state.notes = []; } }
+  function openArtifactModal(note = null) {
+    showModal(`<div class="modal-head"><h2>${note ? 'Edit artifact' : 'New artifact'}</h2><button class="icon-button" data-close>×</button></div><form id="artifactForm"><div class="field"><label>Title</label><input name="title" required maxlength="120" value="${escapeHTML(note?.title || '')}" placeholder="Useful prompt, idea, notes…"></div><div class="field" style="margin-top:12px"><label>Content</label><textarea name="content" rows="9" placeholder="Write or paste something worth keeping…">${escapeHTML(note?.content || '')}</textarea></div><div class="modal-actions">${note ? '<button type="button" class="button danger" id="deleteArtifact">Delete</button>' : ''}<button type="button" class="button subtle" data-close>Cancel</button><button type="submit" class="button primary">Save</button></div></form>`);
+    $('#artifactForm').addEventListener('submit', async event => { event.preventDefault(); const form = new FormData(event.target); try { await api('/api/notes',{method:'POST',body:JSON.stringify({title:form.get('title'),content:form.get('content'),id:note?.id || null})}); await loadNotes(); closeModal(); render(); toast('Artifact saved'); } catch(error) { toast(error.message); } });
+    $('#deleteArtifact')?.addEventListener('click', async () => { if (!confirm('Delete this saved artifact?')) return; try { await api(`/api/notes/${encodeURIComponent(note.id)}`,{method:'DELETE'}); await loadNotes(); closeModal(); render(); toast('Artifact deleted'); } catch(error) { toast(error.message); } });
+  }
+
+  function renderScheduled() {
+    return `<div class="page-shell"><h1 class="page-title">Scheduled</h1><p class="page-desc">Recurring work and timed tasks for this workspace.</p><div class="scheduled-placeholder"><div class="big-symbol">◷</div><h3 style="font-size:15px;margin:0 0 8px">No scheduled tasks yet</h3><p style="font-size:12px;color:var(--muted);line-height:1.6;margin:0">The workspace currently supports local chat, provider connections, projects, and terminal workflows. A scheduler and background task runner are not included in this build.</p></div></div>`;
+  }
+
+  // --- Customize: providers, keys, skills, connectors --------------------
+  function renderCustomize() {
+    const tabs = [['personalization','Personalization'],['providers','Providers & keys'],['skills','Skills'],['connectors','Browser & local tools'],['plugins','Integration status']];
+    let body = '';
+    if (state.customizeTab === 'personalization') body = renderPersonalizationSettings();
+    else if (state.customizeTab === 'providers') body = renderProviderSettings();
+    else if (state.customizeTab === 'skills') body = renderSkillsSettings();
+    else if (state.customizeTab === 'connectors') body = renderConnectorsSettings();
+    else body = `<div class="surface-card"><h3>Integration status</h3><p>Available now: built-in and imported skills, local project files, provider APIs, and the separate embedded Chromium browser. The browser is not your everyday Chrome session.</p><p class="modal-note">There is no third-party OAuth connector runtime or plugin marketplace in this build. GitHub, Drive, Slack and similar services are not connected unless a dedicated integration is added. This page is a capability summary, not a plugin store.</p></div>`;
+    return `<div class="page-shell"><h1 class="page-title">Customize</h1><p class="page-desc">Personalize responses, manage models and keys, and configure tools.</p><div class="section-tabs">${tabs.map(([key,label])=>`<button class="section-tab ${state.customizeTab===key?'active':''}" data-customize-tab="${key}">${label}</button>`).join('')}</div>${body}</div>`;
+  }
+  function renderPersonalizationSettings() {
+    const p = state.personalization || {};
+    const checked = key => p[key] ? 'checked' : '';
+    const option = (value,label,current) => `<option value="${value}" ${current===value?'selected':''}>${label}</option>`;
+    return `<section class="personalization-page">
+      <div class="personalization-intro"><div><span class="personalization-kicker">YOUR MODEL · YOUR RULES</span><h2>Make Spaceline respond your way</h2><p>These preferences are added to the instructions sent to the model you selected. They do not fine-tune the model or change your provider, endpoint, or model.</p></div><span class="personalization-mark" aria-hidden="true">Aa</span></div>
+      <form id="personalizationForm" class="personalization-form">
+        <div class="personalization-grid">
+          <label class="personalization-field"><span>What should Spaceline call you?</span><input name="name" maxlength="80" value="${escapeHTML(p.name||'')}" placeholder="Your preferred name"></label>
+          <label class="personalization-field"><span>How much should it know about your context?</span><textarea name="about" maxlength="1500" rows="3" placeholder="Your role, goals, experience level, tools or constraints…">${escapeHTML(p.about||'')}</textarea></label>
+          <label class="personalization-field"><span>Response tone</span><select name="tone">${option('direct','Direct and candid',p.tone)}${option('friendly','Friendly and conversational',p.tone)}${option('professional','Professional',p.tone)}${option('creative','Creative and exploratory',p.tone)}${option('socratic','Socratic and question-led',p.tone)}</select></label>
+          <label class="personalization-field"><span>Response detail</span><select name="detail">${option('concise','Concise',p.detail)}${option('balanced','Balanced',p.detail)}${option('detailed','Detailed',p.detail)}</select></label>
+          <label class="personalization-field"><span>Preferred structure</span><select name="format">${option('adaptive','Choose what fits the task',p.format)}${option('bullets','Bullet points',p.format)}${option('step_by_step','Step by step',p.format)}${option('prose','Natural paragraphs',p.format)}${option('tables','Tables for comparisons',p.format)}</select></label>
+          <label class="personalization-field"><span>Problem-solving style</span><select name="thinking_style">${option('balanced','Balanced and practical',p.thinking_style)}${option('analytical','Analytical · break down and verify',p.thinking_style)}${option('creative','Creative · explore alternatives',p.thinking_style)}${option('critical','Critical · challenge assumptions',p.thinking_style)}${option('teacher','Teacher · explain and demonstrate',p.thinking_style)}${option('pragmatic','Pragmatic · simplest reliable path',p.thinking_style)}</select></label>
+        </div>
+        <div class="personalization-options"><label><input type="checkbox" name="challenge_assumptions" ${checked('challenge_assumptions')}><span><strong>Challenge my assumptions</strong><small>Point out mistakes, risks and weak reasoning.</small></span></label><label><input type="checkbox" name="explain_steps" ${checked('explain_steps')}><span><strong>Explain useful reasoning</strong><small>Show decisions, key steps and checks—not private internal reasoning.</small></span></label><label><input type="checkbox" name="include_examples" ${checked('include_examples')}><span><strong>Use practical examples</strong><small>Add examples when they make an answer clearer.</small></span></label><label><input type="checkbox" name="ask_when_ambiguous" ${checked('ask_when_ambiguous')}><span><strong>Clarify ambiguity</strong><small>Ask one focused question when an essential detail is missing.</small></span></label></div>
+        <label class="personalization-field personalization-custom"><span>Additional instructions</span><textarea name="custom_instructions" maxlength="4000" rows="5" placeholder="Tell Spaceline exactly how you want it to work: preferred tools, what to avoid, how to explain code, how to review decisions…">${escapeHTML(p.custom_instructions||'')}</textarea><small>Up to 4,000 characters. Do not put passwords or API keys here.</small></label>
+        <div class="personalization-footer"><span>Saved in this local Spaceline workspace · applies to future model requests.</span><div><button type="button" class="button subtle" id="resetPersonalization">Reset defaults</button><button type="submit" class="button primary" id="savePersonalization">Save personalization</button></div></div>
+      </form>
+    </section>`;
+  }
+  function renderSkillsSettings() {
+    const skills = state.skills.map(skill => `<article class="provider-card"><div class="row-between"><div><h3>${escapeHTML(skill.name)}</h3><div class="meta">${escapeHTML(skill.source)} · Auto-trigger: ${escapeHTML(skill.triggers || 'not specified')}</div></div><span class="status-pill">${skill.source === 'built-in' ? 'Built in' : 'Imported'}</span></div><p class="meta" style="margin-top:9px">${escapeHTML(skill.description)}</p></article>`).join('');
+    return `<div class="row-between" style="margin-bottom:13px"><div><h2 style="font-size:14px;margin:0 0 4px">Automatic skills</h2><p class="meta">Relevant skills are added to the model instructions automatically when your message matches their triggers.</p></div><label class="button primary" for="skillImportFile">＋ Import SKILL.md</label><input id="skillImportFile" type="file" multiple accept=".md,.markdown,text/markdown,text/plain" hidden></div><div class="provider-grid">${skills || '<div class="empty-panel">No skills found.</div>'}</div><div class="surface-card" style="margin-top:14px"><h3>Add Claude skills</h3><p>Import a Claude-compatible <code>SKILL.md</code> file. Spaceline stores it locally in <code>Documents\Spaceline\skills</code>, lists it here and loads it automatically when its description or trigger phrases match your request.</p></div>`;
+  }
+  function renderConnectorsSettings() {
+    const page = state.browserPage;
+    return `<div class="surface-card"><div class="row-between"><div><h3>Spaceline embedded browser</h3><p>Open and inspect public websites in Spaceline's separate, persistent Chromium profile. The right-side Browser workbench includes a natural-language command bar for navigation, search, ordinary links/buttons/tabs, safe text fields, select menus, checkboxes, hover and scrolling. This is not your everyday Chrome window or its signed-in session.</p></div><span class="status-pill">Local browser</span></div><form id="browserOpenForm" style="display:flex;gap:8px;margin-top:14px"><input id="browserUrl" style="flex:1;min-width:0;border:1px solid var(--line);border-radius:8px;background:#191919;color:var(--text);padding:10px" placeholder="https://example.com" value="${escapeHTML(page?.url || '')}"><button class="button primary" type="submit">Open inside Spaceline</button></form><div class="row-between" style="margin-top:12px"><span class="meta">${page ? escapeHTML(page.title || page.url) : 'No page inspected this session'}</span><button class="button subtle" id="readChromePage" ${page ? '' : 'disabled'}>Read current page</button></div>${page ? `<div class="browser-preview"><div class="meta">${escapeHTML(page.url)}</div><pre>${escapeHTML(page.text || '').slice(0,7000)}</pre></div>` : ''}<p class="modal-note">First use requires the Playwright Chromium engine. Install it with <code>python -m playwright install chromium</code>. Private, loopback and reserved network destinations are blocked. This does not control your everyday Chrome profile.</p></div><div class="surface-card"><h3>Automatic browser tools</h3><p>When you ask Spaceline to work on a website in a tool-enabled mode, compatible models can navigate, inspect the current page, click ordinary links/buttons/tabs/menu items, fill safe text inputs, select dropdown values, check/uncheck ordinary checkboxes, hover and scroll. Browser page content is treated as untrusted input. Spaceline will not fill credentials/payment data, submit forms, purchase items, send messages or perform destructive/account actions.</p></div><div class="surface-card"><h3>Local workspace tools</h3><p>In Cowork, Deep Think and Code modes with a project selected, compatible models can list, search, read and analyze project files. Code mode additionally allows project-scoped writes and a limited command allowlist. Commands still run with your Windows account permissions; this is not an operating-system sandbox. Do not run untrusted scripts.</p></div>`;
+  }
+  function renderProviderSettings() {
+    const profiles = state.profiles.map(p => {
+      const imageOnly = p.provider === 'aihorde';
+      const bulk = imageOnly ? null : state.bulkModelResults[p.id];
+      const working = bulk?.working_models || [];
+      const bulkStatus = !bulk ? 'Run a quick access check for every listed model.'
+        : bulk.status === 'testing' ? `Testing ${bulk.checked || 0} / ${bulk.total || '?'} · ${working.length} working so far…`
+        : bulk.status === 'complete' ? `${Math.max(0,(bulk.working_count ?? working.length)-(bulk.manual_models || []).length)} passed full scan${(bulk.manual_models || []).length ? ` + ${(bulk.manual_models || []).length} manual checks` : ''} · ${bulk.failed_count || 0} full-scan results not confirmed${formatFailureCategories(bulk.failure_categories) ? ` · ${formatFailureCategories(bulk.failure_categories)}` : ''} · checked ${new Date(bulk.verified_at || Date.now()).toLocaleString()}`
+        : bulk.message || 'Model check failed.';
+      const selectedModelFailed = bulk?.status === 'complete' && p.model && !working.some(item => item.id === p.model);
+      const hasInconclusiveFailures = bulk?.status === 'complete' && Object.keys(bulk.failure_categories || {}).some(category => ['quota','billing','provider_unavailable','connection_error','timeout','unexpected'].includes(category));
+      const modelWarning = selectedModelFailed
+        ? `<div class="model-selection-warning"><span>${hasInconclusiveFailures ? 'Current model was not confirmed; quota or availability errors do not prove the model is unsupported.' : 'Current model was not confirmed by the last access check.'}</span>${working.length ? `<button type="button" class="button subtle" data-use-verified-model="${escapeHTML(p.id)}" data-model-id="${escapeHTML(working[0].id)}">Switch to ${escapeHTML(working[0].id)}</button>` : '<span>No confirmed working models. Retry after checking provider access, billing or quota.</span>'}</div>` : '';
+      const workingRows = bulk?.status === 'complete' && working.length
+        ? `<div class="verified-model-list"><strong>Working models only</strong>${working.map(item=>`<div class="verified-model-row"><span>${escapeHTML(item.id)}</span><button type="button" class="button subtle" data-use-verified-model="${escapeHTML(p.id)}" data-model-id="${escapeHTML(item.id)}">Use</button></div>`).join('')}</div>`
+        : bulk?.status === 'complete' ? '<div class="verified-model-empty">No model passed this account/endpoint test. Failed IDs are hidden.</div>' : '';
+      return `<article class="provider-card ${p.enabled===false?'provider-disabled':''}"><div class="row-between"><div style="display:flex;align-items:center;gap:10px"><div class="provider-mark">${p.provider==='anthropic'?'A':p.provider==='gemini'?'✦':p.provider==='ollama'?'◉':'↗'}</div><div><h3>${escapeHTML(p.name)}</h3><div class="meta">${escapeHTML(providerName(p.provider))} · ${escapeHTML(p.model || 'Model not selected')}</div></div></div>${imageOnly?'<span class="status-pill">Image only</span>':p.id===state.activeProfileId?'<span class="status-pill">Selected</span>':''}</div><div class="profile-endpoint" title="${escapeHTML(p.base_url)}">${escapeHTML(p.base_url)}</div><div class="endpoint-transport ${p.base_url?.startsWith('https://')?'secure':p.base_url?.startsWith('http://')?(endpointTransportLabel(p.base_url).startsWith('LOCAL')?'local-http':'blocked-http'):'unknown'}">${escapeHTML(endpointTransportLabel(p.base_url))}</div><div class="row-between" style="margin-top:12px"><span class="meta">${imageOnly?(p.key_label?'Registered key · higher queue priority':'Free anonymous access · lowest queue priority'):!connectionNeedsKey(p.provider,p.auth_mode)?(providerNeedsKey(p.provider)?'No authentication':'Local model'):p.key_label ? 'Key pool · '+(p.key_ids?.length || 1)+' key(s)' : 'API key needed'}</span><label class="profile-pool-toggle"><input type="checkbox" data-profile-enabled="${escapeHTML(p.id)}" ${p.enabled===false?'':'checked'}><span>${p.enabled===false?'Disabled':'Enabled'}</span></label></div><div class="row-between" style="margin-top:10px"><span class="meta">${p.enabled===false?'Disabled':imageOnly?'Image-only provider · use in Image Studio':'Available connection — selected explicitly'}</span><div style="display:flex;gap:6px"><button class="button subtle" data-profile-edit="${escapeHTML(p.id)}">Edit</button><button class="button subtle" data-profile-test="${escapeHTML(p.id)}" ${p.enabled===false?'disabled':''}>${imageOnly?'Image models':'Models'}</button>${imageOnly?'':'<button class="button subtle" data-profile-active="'+escapeHTML(p.id)+'" '+(p.enabled===false?'disabled':'')+'>Select</button>'}</div></div>${imageOnly?'':modelWarning+`<div class="bulk-model-check"><div><strong>Test all models</strong><span id="bulkModelStatus-${escapeHTML(p.id)}">${escapeHTML(bulkStatus)}</span></div><button type="button" class="button ${bulk?.status==='testing'?'subtle':'primary'}" data-profile-test-all="${escapeHTML(p.id)}" ${p.enabled===false||bulk?.status==='testing'?'disabled':''}>${bulk?.status==='testing'?'Testing…':'Test all models'}</button></div>${workingRows}`}</article>`;
+    }).join('');
+    const keys = state.keys.map(k => {
+      const test = state.keyTestResults[k.id];
+      const testStatus = test ? `<span class="key-test-result ${test.state}" title="${escapeHTML(test.message || '')}">${test.state === 'testing' ? 'Testing…' : test.state === 'success' ? `Auth OK${Number.isInteger(test.modelCount) ? ` · ${test.modelCount} IDs listed` : ''}` : 'Failed'}</span>` : '';
+      return `<div class="key-row"><div class="key-icon">⌑</div><div class="key-info"><strong>${escapeHTML(k.label)}</strong><span>${escapeHTML(k.provider)}${k.base_url ? ' · '+escapeHTML(k.base_url) : ''}</span>${testStatus}</div><span class="key-mask">••••••••</span><button class="button subtle" data-key-test="${escapeHTML(k.id)}" ${state.bulkKeyTestRunning || test?.state === 'testing' ? 'disabled' : ''}>${test?.state === 'testing' ? 'Testing…' : 'Test connection'}</button><button class="button danger" data-key-delete="${escapeHTML(k.id)}">Remove</button></div>`;
+    }).join('');
+    return `<div class="row-between" style="margin-bottom:13px"><div><h2 style="font-size:14px;margin:0 0 4px">Model connections</h2><p style="font-size:11px;color:var(--muted);margin:0">You can save several connections, but Spaceline uses only the connection you explicitly select. It never switches to another provider or model on failure. A saved key pool may rotate credentials for the same selected model only.</p></div><button class="button primary" id="newConnection">＋ Add connection</button></div>
+      <div class="provider-grid">${profiles || '<div class="empty-panel" style="grid-column:1/-1">No model connections yet. Add your first provider to start chatting.</div>'}</div>
+      <div class="modal-note provider-pool-note">Only your explicitly selected connection receives chat requests. If that model fails, Spaceline stops and reports the error; it will not switch providers or model IDs. If the selected connection contains multiple saved API keys, Spaceline may retry credentials for the same provider and exact model after an authentication denial. No different model is selected.</div>
+      <div class="row-between api-key-vault-heading" style="margin:28px 0 8px"><div><h2 style="font-size:14px;margin:0 0 4px">API key vault</h2><p style="font-size:11px;color:var(--muted);margin:0">Secrets are stored in Windows Credential Manager. This workspace stores only labels and references.</p></div><div class="api-key-vault-actions"><button class="button subtle" id="testAllSavedKeys" type="button" ${!state.keys.length||state.bulkKeyTestRunning?'disabled':''}>${state.bulkKeyTestRunning?'Testing keys…':'✓ Test all saved keys'}</button><button class="button" id="addKey">＋ Add API key</button></div></div>
+      ${state.bulkKeyTestProgress?`<div class="key-bulk-progress" role="status" aria-live="polite"><div><strong>${state.bulkKeyTestProgress.done} / ${state.bulkKeyTestProgress.total} keys checked</strong><span>${escapeHTML(state.bulkKeyTestProgress.label || 'Checking saved provider credentials…')}</span></div><div class="key-bulk-progress-track"><span style="width:${Math.round(state.bulkKeyTestProgress.done/Math.max(1,state.bulkKeyTestProgress.total)*100)}%"></span></div></div>`:''}
+      <div class="surface-card" style="padding:4px 15px">${keys || '<div class="quiet-note">No API keys saved yet.</div>'}</div>
+      <div class="modal-note">FreeLLM and other gateways can be added as OpenAI-compatible connections. Use the exact API base URL from that provider, for example <code>http://127.0.0.1:31415/v1</code> for a local gateway. Cloud providers must use HTTPS; local loopback services may use HTTP. A listed model is not automatically usable: run its per-model Test access probe to verify this key/account. The probe sends one tiny request and may incur a minimal charge.</div>`;
+  }
+  function safeKeyTestError(error) {
+    const status = Number(error?.status || 0);
+    if (status === 401) return 'Authentication rejected. Check this key.';
+    if (status === 402) return 'Provider billing or credits required.';
+    if (status === 403) return 'Provider denied access to this key or endpoint.';
+    if (status === 404) return 'Provider endpoint or saved key was not found.';
+    if (status === 408 || status === 504) return 'Provider request timed out.';
+    if (status === 429) return 'Provider rate limit or quota reached.';
+    if (status >= 500) return 'Provider service or gateway error.';
+    if (status === 0) return 'Network connection failed.';
+    return `Connection check failed (HTTP ${status}).`;
+  }
+  async function testAllSavedKeys() {
+    if (state.bulkKeyTestRunning) return;
+    if (Object.values(state.keyTestResults).some(result => result?.state === 'testing')) { toast('A key connection test is already running.'); return; }
+    const keys = [...state.keys];
+    if (!keys.length) { toast('No saved API keys to test.'); return; }
+    if (!window.confirm(`Test authentication for all ${keys.length} saved API key(s)? Spaceline will contact each key’s provider model-list endpoint. It will not generate content or reveal key values.`)) return;
+    state.bulkKeyTestRunning = true;
+    state.bulkKeyTestProgress = {done:0,total:keys.length,label:'Starting secure connection checks…'};
+    for (const key of keys) {
+      state.keyTestResults[key.id] = {state:'testing',message:'Checking provider authentication…'};
+      state.bulkKeyTestProgress.label = `Checking ${key.label || key.provider}…`;
+      if (state.view === 'customize') render();
+      try {
+        const result = await api(`/api/keys/${encodeURIComponent(key.id)}/test`, {method:'POST'});
+        state.keyTestResults[key.id] = {state:'success',message:result.message || 'Provider authentication succeeded; model access still needs a model-level test.',modelCount:result.model_count};
+      } catch (error) {
+        state.keyTestResults[key.id] = {state:'error',message:safeKeyTestError(error)};
+      }
+      state.bulkKeyTestProgress.done += 1;
+      if (state.view === 'customize') render();
+    }
+    const passed = keys.filter(key=>state.keyTestResults[key.id]?.state==='success').length;
+    const failed = keys.length - passed;
+    state.bulkKeyTestRunning = false;
+    state.bulkKeyTestProgress = {done:keys.length,total:keys.length,label:`Finished · ${passed} authenticated · ${failed} failed`};
+    if (state.view === 'customize') render();
+    toast(`API key test complete · ${passed} passed · ${failed} failed`);
+  }
+
+  async function bindCustomize() {
+    $$('.section-tab').forEach(button => button.addEventListener('click', () => { state.customizeTab = button.dataset.customizeTab; render(); }));
+    $('#personalizationForm')?.addEventListener('submit', async event => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const fields = new FormData(form);
+      const payload = {
+        name:String(fields.get('name') || '').trim(), about:String(fields.get('about') || '').trim(),
+        tone:String(fields.get('tone') || 'direct'), detail:String(fields.get('detail') || 'balanced'),
+        format:String(fields.get('format') || 'adaptive'), thinking_style:String(fields.get('thinking_style') || 'balanced'),
+        challenge_assumptions:form.querySelector('[name="challenge_assumptions"]').checked,
+        explain_steps:form.querySelector('[name="explain_steps"]').checked,
+        include_examples:form.querySelector('[name="include_examples"]').checked,
+        ask_when_ambiguous:form.querySelector('[name="ask_when_ambiguous"]').checked,
+        custom_instructions:String(fields.get('custom_instructions') || '').trim()
+      };
+      const saveButton = $('#savePersonalization'); if (saveButton) { saveButton.disabled = true; saveButton.textContent = 'Saving…'; }
+      try {
+        state.personalization = await api('/api/personalization', {method:'PUT', body:JSON.stringify(payload)});
+        toast('Personalization saved · applies to future responses');
+        render();
+      } catch (error) { toast(`Could not save personalization: ${error.message}`); }
+      finally { const button = $('#savePersonalization'); if (button) { button.disabled = false; button.textContent = 'Save personalization'; } }
+    });
+    $('#resetPersonalization')?.addEventListener('click', async () => {
+      const defaults = {name:'',about:'',tone:'direct',detail:'balanced',format:'adaptive',thinking_style:'balanced',challenge_assumptions:true,explain_steps:true,include_examples:true,ask_when_ambiguous:true,custom_instructions:''};
+      try { state.personalization = await api('/api/personalization', {method:'PUT', body:JSON.stringify(defaults)}); render(); toast('Personalization reset to defaults'); }
+      catch (error) { toast(`Could not reset personalization: ${error.message}`); }
+    });
+    $('#newConnection')?.addEventListener('click', () => openConnectionModal());
+    $('#addKey')?.addEventListener('click', () => openKeyModal());
+    $('#testAllSavedKeys')?.addEventListener('click', testAllSavedKeys);
+    $('#skillImportFile')?.addEventListener('change', async event => {
+      const files = [...(event.target.files || [])]; if (!files.length) return;
+      let imported = 0;
+      for (const file of files) {
+        try {
+          const content = await file.text();
+          await api('/api/skills/import',{method:'POST',body:JSON.stringify({name:file.name.replace(/\.md$/i,''),content})});
+          imported += 1;
+        } catch(error) { toast(`${file.name}: ${error.message}`); }
+      }
+      await loadSkills(); render();
+      if (imported) toast(`${imported} skill file(s) imported and ready for automatic activation`);
+      event.target.value = '';
+    });
+    $('#browserOpenForm')?.addEventListener('submit', async event => {
+      event.preventDefault(); const url = $('#browserUrl').value.trim();
+      try { state.browserPage = await api('/api/browser/open',{method:'POST',body:JSON.stringify({url})}); render(); toast('Opened inside Spaceline'); }
+      catch(error) { toast(error.message); }
+    });
+    $('#readChromePage')?.addEventListener('click', async () => {
+      try { state.browserPage = await api('/api/browser/page'); render(); toast('Page refreshed'); }
+      catch(error) { toast(error.message); }
+    });
+    $$('[data-profile-edit]').forEach(button => button.addEventListener('click', () => { const p = state.profiles.find(x=>x.id===button.dataset.profileEdit); if(p) openConnectionModal(p); }));
+    $$('[data-profile-test]').forEach(button => button.addEventListener('click', () => { const p = state.profiles.find(item=>item.id===button.dataset.profileTest); if (p?.provider==='aihorde') loadRemoteImageModels(p.id, true); else discoverModels(button.dataset.profileTest); }));
+    $$('[data-profile-test-all]').forEach(button => button.addEventListener('click', () => testAllModels(button.dataset.profileTestAll)));
+    $$('[data-use-verified-model]').forEach(button => button.addEventListener('click', () => saveVerifiedModel(button.dataset.useVerifiedModel, button.dataset.modelId)));
+    $$('[data-profile-enabled]').forEach(input => input.addEventListener('change', async () => {
+      const id = input.dataset.profileEnabled;
+      input.disabled = true;
+      try {
+        await api(`/api/providers/${encodeURIComponent(id)}/enabled`, {method:'POST', body:JSON.stringify({enabled:input.checked})});
+        await loadProviders(); renderSidebar(); render();
+        toast(input.checked ? 'Connection enabled; it will not be used until selected' : 'Connection disabled');
+      } catch(error) {
+        input.checked = !input.checked;
+        toast(error.message);
+      } finally { input.disabled = false; }
+    }));
+    $$('[data-profile-active]').forEach(button => button.addEventListener('click', async () => { await setActiveProfile(button.dataset.profileActive); render(); }));
+    $$('[data-key-test]').forEach(button => button.addEventListener('click', async () => {
+      const keyId = button.dataset.keyTest;
+      state.keyTestResults[keyId] = {state:'testing', message:'Checking the provider authentication endpoint…'};
+      render();
+      try {
+        const result = await api(`/api/keys/${encodeURIComponent(keyId)}/test`, {method:'POST'});
+        state.keyTestResults[keyId] = {state:'success', message:result.message || 'Authentication successful; model entitlement still requires a per-model test.', modelCount:result.model_count};
+        toast(result.message || 'API key connection successful');
+      } catch(error) {
+        const message = safeKeyTestError(error);
+        state.keyTestResults[keyId] = {state:'error', message};
+        toast(`API key test failed: ${message}`);
+      }
+      render();
+    }));
+    $$('[data-key-delete]').forEach(button => button.addEventListener('click', async () => {
+      if (!confirm('Remove this key from Windows Credential Manager?')) return;
+      try { await api(`/api/keys/${encodeURIComponent(button.dataset.keyDelete)}`,{method:'DELETE'}); delete state.keyTestResults[button.dataset.keyDelete]; await loadKeys(); await loadProviders(); render(); toast('API key removed'); }
+      catch(error) { toast(error.message); }
+    }));
+  }
+  function providerOptions(selectedProvider) {
+    const presets = state.providerPresets.length ? state.providerPresets : [
+      {id:'openai',label:'OpenAI',category:'cloud',default_base_url:'https://api.openai.com/v1',key_required:true},
+      {id:'nvidia',label:'NVIDIA NIM',category:'cloud',default_base_url:'https://integrate.api.nvidia.com/v1',key_required:true},
+      {id:'groq',label:'Groq',category:'cloud',default_base_url:'https://api.groq.com/openai/v1',key_required:true},
+      {id:'openrouter',label:'OpenRouter',category:'cloud',default_base_url:'https://openrouter.ai/api/v1',key_required:true},
+      {id:'deepseek',label:'DeepSeek',category:'cloud',default_base_url:'https://api.deepseek.com/v1',key_required:true},
+      {id:'kimi',label:'Kimi (Moonshot AI)',category:'cloud',default_base_url:'https://api.moonshot.ai/v1',key_required:true},
+      {id:'anthropic',label:'Anthropic Claude',category:'cloud',default_base_url:'https://api.anthropic.com/v1',key_required:true},
+      {id:'gemini',label:'Google Gemini',category:'cloud',default_base_url:'https://generativelanguage.googleapis.com/v1beta',key_required:true},
+      {id:'edenai',label:'Eden AI',category:'cloud',default_base_url:'https://api.edenai.run/v3',key_required:true},
+      {id:'aihorde',label:'AI Horde (Free Community Images)',category:'cloud',default_base_url:'https://aihorde.net/api',key_required:false},
+      {id:'ollama',label:'Ollama (local)',category:'local',default_base_url:'http://127.0.0.1:11434',key_required:false},
+      {id:'freellm',label:'FreeLLM API (local gateway)',category:'local',default_base_url:'http://127.0.0.1:31415/v1',key_required:true},
+      {id:'openai-compatible',label:'Custom OpenAI-compatible',category:'custom',default_base_url:'https://api.openai.com/v1',key_required:true},
+    ];
+    const categories = [
+      ['cloud','Cloud providers'], ['local','Local / gateway'], ['custom','Custom endpoint']
+    ];
+    return categories.map(([category,label]) => {
+      const items = presets.filter(item=>item.category===category);
+      return items.length ? `<optgroup label="${label}">${items.map(item=>`<option value="${escapeHTML(item.id)}" ${selectedProvider===item.id?'selected':''}>${escapeHTML(item.label)}</option>`).join('')}</optgroup>` : '';
+    }).join('');
+  }
+  function keysForProvider(provider) {
+    const groups = {
+      freellm: ['freellm','freellmapi','freellmapilocalgateway','freellmlocalgateway','free llm api','free llm api local gateway'],
+      nvidia: ['nvidia','nvidianim'], anthropic: ['anthropic','anthropicclaude','claude'],
+      gemini: ['gemini','googlegemini','googleai'], kimi: ['kimi','moonshot','moonshotai','kimimoonshotai'],
+      edenai: ['edenai','edenaiapi','edenaiimages'],
+      aihorde: ['aihorde','aihordeimages','stablehorde','stablehordeimages'],
+      huggingface: ['huggingface','huggingfaceinference'], xai: ['xai','grok','xaigrok'],
+      qwen: ['qwen','alibabadashscope','qwenalibabadashscope'], cohere: ['cohere','coherecompatibilityapi'],
+      'openai-compatible': ['openaicompatible','customopenaicompatible','customopenaicompatiblefreellm'],
+    };
+    const compact = value => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g,'');
+    const wanted = compact(provider);
+    const accepted = groups[provider] || [wanted];
+    return state.keys.filter(key => accepted.includes(compact(key.provider)) || compact(key.provider) === wanted);
+  }
+  function connectionNeedsKey(provider, authMode) {
+    const preset = providerPreset(provider);
+    const nativeProtocol = ['anthropic','gemini','ollama'].includes(preset?.protocol);
+    if (provider === 'aihorde') return true; // show optional registered key selector; anonymous mode remains valid
+    return !(authMode === 'none' && !nativeProtocol) && providerNeedsKey(provider);
+  }
+
+  function openConnectionModal(profile = null, existingId = null) {
+    const profileId = existingId || profile?.id || null;
+    const isExisting = Boolean(profileId);
+    const selectedProvider = profile?.provider || 'openai';
+    const selectedPreset = providerPreset(selectedProvider);
+    const profileKeyIds = profile?.key_ids?.length ? profile.key_ids : [profile?.key_id].filter(Boolean);
+    const candidateKeys = keysForProvider(selectedProvider);
+    const initialKeys = profileKeyIds.length ? profileKeyIds : candidateKeys.map(k=>k.id);
+    const authMode = profile?.auth_mode || 'bearer';
+    const presetProtocol = selectedPreset?.protocol || 'openai-compatible';
+    const keyRequired = connectionNeedsKey(selectedProvider, authMode);
+    const keys = candidateKeys.map(k=>`<option value="${escapeHTML(k.id)}" ${initialKeys.includes(k.id)?'selected':''}>${escapeHTML(k.label)}</option>`).join('');
+    const endpoint = profile?.base_url || selectedPreset?.default_base_url || 'https://api.openai.com/v1';
+    showModal(`<div class="modal-head"><h2>${isExisting?'Edit connection':'Add model connection'}</h2><button class="icon-button" data-close>×</button></div>
+      <form id="connectionForm"><div class="form-grid">
+        <div class="field full"><label>Connection name</label><input name="name" required maxlength="80" value="${escapeHTML(profile?.name || '')}" placeholder="Groq · Llama / Kimi · Coder"></div>
+        <div class="field"><label>Provider</label><select name="provider" id="connectionProvider">${providerOptions(selectedProvider)}</select><small>Choose a vendor preset or a custom endpoint.</small></div>
+        <div class="field"><label>Model ID</label><input name="model" maxlength="200" value="${escapeHTML(profile?.model || '')}" placeholder="Enter exact model ID"></div>
+        <div class="field full"><label>API base URL</label><input name="base_url" id="connectionBaseUrl" maxlength="500" value="${escapeHTML(endpoint)}" placeholder="https://api.example.com/v1"><small>Preset URL is filled automatically. You can override it. Do not append /chat/completions.</small></div>
+        <div class="field" id="authModeField" style="${['anthropic','gemini','ollama'].includes(presetProtocol)?'display:none':''}"><label>API authentication</label><select name="auth_mode" id="connectionAuthMode"><option value="bearer" ${authMode==='bearer'?'selected':''}>Bearer token (usual)</option><option value="x-api-key" ${authMode==='x-api-key'?'selected':''}>X-API-Key header</option><option value="api-key" ${authMode==='api-key'?'selected':''}>API-Key header</option><option value="none" ${authMode==='none'?'selected':''}>No authentication</option></select><small>For gateways, match the header configured by that gateway. Native Claude/Gemini/Ollama auth is handled automatically.</small></div>
+        <div class="field full" id="connectionKeyField" style="${keyRequired?'':'display:none'}"><label>${selectedProvider==='aihorde'?'Optional registered AI Horde API key':'API keys (multiple allowed)'}</label><select name="key_ids" id="connectionKeys" multiple size="${Math.min(5,Math.max(2,candidateKeys.length))}" style="min-height:86px">${keys}</select><small>${selectedProvider==='aihorde'?'Optional: leave this empty to use AI Horde’s free anonymous access. A registered free key improves queue priority; it does not require payment. <a href=\"https://aihorde.net/register\" target=\"_blank\" rel=\"noopener noreferrer\">Register free</a>.':'Only the keys you select are used for this connection. Spaceline may try another selected key after an authentication failure; it never changes the selected provider or model.'}</small></div>
+      </div><div class="modal-actions"><button type="button" class="button subtle" id="modalAddKey">＋ Add API key</button><span style="flex:1"></span><button type="button" class="button subtle" data-close>Cancel</button><button type="submit" class="button primary">${isExisting?'Save changes':'Create connection'}</button></div></form>`);
+    const providerSelect = $('#connectionProvider');
+    let previousProvider = providerSelect.value;
+    const syncConnectionAuth = () => {
+      const preset = providerPreset(providerSelect.value);
+      const nativeProtocol = ['anthropic','gemini','ollama'].includes(preset?.protocol);
+      $('#authModeField').style.display = nativeProtocol ? 'none' : '';
+      const mode = nativeProtocol ? 'bearer' : ($('#connectionAuthMode')?.value || 'bearer');
+      $('#connectionKeyField').style.display = connectionNeedsKey(providerSelect.value, mode) ? '' : 'none';
+    };
+    providerSelect.addEventListener('change', () => {
+      if (previousProvider !== providerSelect.value) {
+        const modelInput = $('#connectionForm [name=model]');
+        if (modelInput) modelInput.value = '';
+        previousProvider = providerSelect.value;
+      }
+      const preset = providerPreset(providerSelect.value);
+      if (preset?.default_base_url) $('#connectionBaseUrl').value = preset.default_base_url;
+      const candidates = keysForProvider(providerSelect.value);
+      $('#connectionKeys').innerHTML = candidates.map(key=>`<option value="${escapeHTML(key.id)}" selected>${escapeHTML(key.label)}</option>`).join('');
+      const helper = $('#connectionKeyField small');
+      const keyLabel = $('#connectionKeyField label');
+      if (providerSelect.value === 'aihorde') {
+        if (keyLabel) keyLabel.textContent = 'Optional registered AI Horde API key';
+        if (helper) helper.innerHTML = 'Optional: leave this empty to use AI Horde’s free anonymous access. A registered free key improves queue priority; it does not require payment. <a href=\"https://aihorde.net/register\" target=\"_blank\" rel=\"noopener noreferrer\">Register free</a>.';
+      } else {
+        if (keyLabel) keyLabel.textContent = 'API keys (multiple allowed)';
+        if (helper) helper.textContent = 'Only the keys you select are used for this connection. Spaceline may try another selected key after an authentication failure; it never changes the selected provider or model.';
+      }
+      syncConnectionAuth();
+    });
+    $('#connectionAuthMode')?.addEventListener('change', syncConnectionAuth);
+    $('#modalAddKey').addEventListener('click', () => {
+      const form = new FormData($('#connectionForm'));
+      const keyIds = form.getAll('key_ids');
+      const draft = {id:profileId,name:form.get('name'),provider:form.get('provider'),base_url:form.get('base_url'),model:form.get('model'),auth_mode:form.get('auth_mode') || 'bearer',key_id:keyIds[0] || null,key_ids:keyIds};
+      openKeyModal(() => openConnectionModal(draft, profileId), form.get('provider'));
+    });
+    $('#connectionForm').addEventListener('submit', async event => {
+      event.preventDefault(); const form = new FormData(event.target); const provider = form.get('provider');
+      const preset = providerPreset(provider);
+      const selectedAuthMode = form.get('auth_mode') || 'bearer';
+      const needsKey = connectionNeedsKey(provider, selectedAuthMode);
+      const keyIds = needsKey ? form.getAll('key_ids') : [];
+      const payload = {name:form.get('name'),provider,base_url:form.get('base_url'),model:form.get('model'),auth_mode:selectedAuthMode,key_id:keyIds[0] || null,key_ids:keyIds};
+      try {
+        if (profileId && (provider !== profile.provider || payload.model !== profile.model || String(payload.base_url || '').replace(/\/+$/, '') !== String(profile.base_url || '').replace(/\/+$/, ''))) {
+          const approved = await confirmModelSwitch(selectedProfile(), {...profile, ...payload}, 'You are changing the provider, endpoint or model saved in this connection. The active selection only changes if you separately approve that switch.');
+          if (!approved) return;
+          Object.assign(payload, {confirm_model_switch: true});
+        }
+        const url = profileId ? `/api/providers/${encodeURIComponent(profileId)}` : '/api/providers';
+        await api(url,{method:profileId?'PUT':'POST',body:JSON.stringify(payload)});
+        await loadProviders(); closeModal(); render(); toast(profileId?'Connection updated':'Connection added');
+      } catch(error) { toast(error.message); }
+    });
+  }
+  function openKeyModal(afterSave = null, suggestedProvider = 'openai') {
+    const presets = state.providerPresets.length ? state.providerPresets : [{id:'openai',label:'OpenAI'},{id:'groq',label:'Groq'},{id:'nvidia',label:'NVIDIA NIM'},{id:'kimi',label:'Kimi (Moonshot AI)'},{id:'openai-compatible',label:'Custom OpenAI-compatible / FreeLLM'}];
+    const suggestedLabel = presets.find(item=>item.id===suggestedProvider)?.label || suggestedProvider;
+    const keyOptions = presets.filter(item=>item.key_required !== false).map(item=>`<option value="${escapeHTML(item.id)}" ${suggestedProvider===item.id?'selected':''}>${escapeHTML(item.label)}</option>`).join('');
+    showModal(`<div class="modal-head"><h2>Add API key</h2><button class="icon-button" data-close>×</button></div><form id="keyForm"><div class="form-grid">
+      <div class="field full"><label>Provider</label><select name="provider" id="keyProvider">${keyOptions}<option value="__custom__">Other / custom provider…</option></select></div>
+      <div class="field full" id="customKeyProviderField" style="display:none"><label>Custom provider label</label><input name="custom_provider" id="customKeyProvider" maxlength="40" placeholder="e.g. My private inference API"></div>
+      <div class="field"><label>Key name</label><input name="label" required maxlength="80" placeholder="Main key / Backup key"></div>
+      <div class="field full"><label>Secret API key</label><input name="secret" type="password" autocomplete="new-password" required maxlength="2500" placeholder="Paste the API key here"></div>
+      <div class="field full"><label>Optional API base URL override</label><input name="base_url" maxlength="300" placeholder="Usually leave this blank; set it on the connection instead"></div>
+    </div><p class="modal-note">The secret is sent only to the local Spaceline backend and stored in Windows Credential Manager. It is never returned to the browser after saving. You can store multiple keys under the same provider.</p><div class="modal-actions"><button type="button" class="button subtle" data-close>Cancel</button><button type="submit" class="button primary">Save key securely</button></div></form>`);
+    $('#keyProvider').addEventListener('change', () => { $('#customKeyProviderField').style.display = $('#keyProvider').value==='__custom__' ? '' : 'none'; });
+    $('#keyForm').addEventListener('submit', async event => {
+      event.preventDefault(); const form = new FormData(event.target);
+      const customProviderLabel = String(form.get('custom_provider')||'').trim();
+      const savedProvider = form.get('provider') === '__custom__' ? 'openai-compatible' : form.get('provider');
+      if (form.get('provider') === '__custom__' && !customProviderLabel) { toast('Enter a label for this custom OpenAI-compatible key.'); return; }
+      const keyLabel = String(form.get('label') || '').trim();
+      const savedLabel = customProviderLabel ? `${keyLabel} · ${customProviderLabel}`.slice(0, 80) : keyLabel;
+      try { await api('/api/keys',{method:'POST',body:JSON.stringify({provider:savedProvider,label:savedLabel,secret:form.get('secret'),base_url:form.get('base_url')})}); await loadKeys(); closeModal(); if(afterSave) afterSave(); else if(state.view==='customize') render(); toast('API key saved securely'); }
+      catch(error) { toast(error.message); }
+    });
+  }
+  async function discoverModels(profileId) {
+    const profile = state.profiles.find(p=>p.id===profileId);
+    if (!profile) { toast('Choose a provider connection first.'); return; }
+    try {
+      toast('Refreshing the provider model catalogue…');
+      const data = await api(`/api/providers/${encodeURIComponent(profileId)}/models`);
+      const checked = state.bulkModelResults[profileId];
+      const verified = checked?.status === 'complete' ? (checked.working_models || []).map(item=>item.id) : null;
+      const models = verified === null ? (data.models || []) : verified;
+      const catalog = verified === null ? (data.catalog || []) : (data.catalog || []).filter(item=>verified.includes(item.id));
+      state.modelsByProfile[profileId] = models;
+      state.modelCatalogByProfile[profileId] = catalog;
+      openModelsModal(profile, models, verified === null ? (data.message || 'Live model list') : `${models.length} verified working models · failed/unavailable IDs are hidden`, catalog);
+      if (models.length) toast(`${models.length} models loaded`);
+      else toast(data.message || 'No models were listed. You can enter a model ID manually.');
+    } catch(error) {
+      openModelsModal(profile, state.modelsByProfile[profileId] || [], error.message, state.modelCatalogByProfile[profileId] || []);
+      toast(error.message);
+    }
+  }
+  async function saveVerifiedModel(profileId, model) {
+    const profile = state.profiles.find(item=>item.id===profileId);
+    if (!profile || !model) return;
+    try {
+      if (model !== profile.model) {
+        const approved = await confirmModelSwitch(selectedProfile(), {...profile, model}, 'You chose a different verified model ID for this connection. The active connection will stay as-is unless you explicitly select this one too.');
+        if (!approved) return;
+      }
+      await api(`/api/providers/${encodeURIComponent(profileId)}`, {method:'PUT', body:JSON.stringify({...profile, model, confirm_model_switch:true, enabled:profile.enabled!==false, auth_mode:profile.auth_mode || 'bearer', key_ids:profile.key_ids || [profile.key_id].filter(Boolean)})});
+      await loadProviders(); renderSidebar(); render();
+      toast(`Selected verified model: ${model}`);
+    } catch (error) { toast(error.message); }
+  }
+
+  async function testAllModels(profileId) {
+    const profile = state.profiles.find(item=>item.id===profileId);
+    if (!profile || profile.enabled===false) { toast('Enable this connection before testing models.'); return; }
+    const currentButton = document.querySelector(`[data-profile-test-all="${CSS.escape(profileId)}"]`);
+    if (currentButton) { currentButton.disabled = true; currentButton.textContent = 'Loading models…'; }
+    try {
+      const catalogue = await api(`/api/providers/${encodeURIComponent(profileId)}/models`);
+      const models = [...new Set((catalogue.models || []).filter(Boolean))];
+      if (!models.length) throw new Error(catalogue.message || 'The provider did not return any model IDs to test.');
+      if (models.length > 300) throw new Error(`This connection exposes ${models.length} model IDs. Bulk testing is capped at 300 per run to avoid excessive provider requests. Filter the catalogue and test individual models instead.`);
+      if (!confirm(`Spaceline found ${models.length} model IDs for ${profile.name}. Test every one with a minimal generation request?\n\nEach model gets a minimal generation probe and may use provider quota or incur a charge. When a key pool has multiple credentials, another key may be tried after an authorization/permission denial. Failed IDs will be hidden; only passing models will be shown.`)) {
+        if (currentButton) { currentButton.disabled = false; currentButton.textContent = 'Test all models'; }
+        return;
+      }
+      removePersistedModelResults(profileId);
+      state.bulkModelResults[profileId] = {status:'testing', total:models.length, checked:0, working_models:[], failed_count:0, failure_categories:{}};
+      const statusNode = document.getElementById(`bulkModelStatus-${profileId}`);
+      if (statusNode) statusNode.textContent = `Testing 0 / ${models.length}…`;
+      if (currentButton) currentButton.textContent = 'Testing…';
+      const response = await fetch(`/api/providers/${encodeURIComponent(profileId)}/models/verify-all`, {
+        method:'POST', headers:{'Content-Type':'application/json','X-Spaceline-Token':TOKEN}, body:JSON.stringify({models})
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(()=>({}));
+        throw new Error(error.detail || `Model verification failed (${response.status})`);
+      }
+      if (!response.body) throw new Error('The server did not return a model-test stream.');
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer='';
+      const applyEvent = event => {
+        const result = state.bulkModelResults[profileId]; if (!result) return;
+        if (event.type === 'progress') {
+          result.checked = event.index;
+          if (event.ok) {
+            if (!result.working_models.some(item=>item.id===event.model)) result.working_models.push({id:event.model,name:event.model,status:'verified'});
+          } else {
+            result.failed_count = (result.failed_count || 0) + 1;
+            const category = event.failure_category || 'provider_error';
+            result.failure_categories = result.failure_categories || {};
+            result.failure_categories[category] = (result.failure_categories[category] || 0) + 1;
+          }
+          const node = document.getElementById(`bulkModelStatus-${profileId}`);
+          if (node) node.textContent = `Tested ${result.checked} / ${result.total} · ${result.working_models.length} working · ${result.failed_count} not confirmed`;
+          if (currentButton) currentButton.textContent = `Testing ${result.checked}/${result.total}`;
+        } else if (event.type === 'complete') {
+          result.status='complete'; result.checked=event.tested; result.working_count=event.working_count;
+          result.failed_count=event.failed_count; result.failure_categories=event.failure_categories || result.failure_categories || {};
+          result.manual_models=[]; result.working_models=event.working_models || [];
+          result.verified_at=Date.now();
+          state.verifiedModelsByProfile[profileId] = result.working_models;
+          persistVerifiedModelResults(profileId);
+        } else if (event.type === 'error') throw new Error(event.message || 'Bulk model test failed.');
+      };
+      while (true) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, {stream:true});
+        const chunks = buffer.split('\n\n'); buffer = chunks.pop() || '';
+        for (const chunk of chunks) {
+          const line = chunk.split('\n').find(item=>item.startsWith('data:'));
+          if (line) applyEvent(JSON.parse(line.slice(5).trim()));
+        }
+      }
+      if (buffer.trim()) {
+        const line = buffer.split('\n').find(item=>item.startsWith('data:'));
+        if (line) applyEvent(JSON.parse(line.slice(5).trim()));
+      }
+      const final = state.bulkModelResults[profileId];
+      if (!final || final.status !== 'complete') throw new Error('The model-test stream ended before a final result was received.');
+      state.modelsByProfile[profileId] = final.working_models.map(item=>item.id);
+      state.modelCatalogByProfile[profileId] = final.working_models;
+      render();
+      const failures = formatFailureCategories(final.failure_categories);
+      toast(`${final.working_count} working models confirmed. ${final.failed_count} not confirmed${failures ? ` · ${failures}` : ''}.`);
+      pushActivity('Model access check complete', `${final.working_count} working of ${final.checked} tested for ${profile.name}`);
+    } catch (error) {
+      removePersistedModelResults(profileId);
+      state.bulkModelResults[profileId] = {status:'error', message:error.message, working_models:[]};
+      render(); toast(error.message); pushActivity('Model access check failed', error.message, 'error');
+    }
+  }
+
+  function openModelsModal(profile, initialModels, message = '', initialCatalog = []) {
+    let models = [...new Set((initialModels || []).filter(Boolean))].sort((a,b)=>a.localeCompare(b,undefined,{sensitivity:'base'}));
+    let catalog = new Map((initialCatalog || []).filter(item=>item?.id).map(item=>[item.id,item]));
+    for (const id of models) if (!catalog.has(id)) catalog.set(id, {id, name:id, pricing_status:'unknown', pricing_label:'Pricing not exposed by provider', free_variant:false});
+    let bulkResult = state.bulkModelResults[profile?.id];
+    let verifiedIds = bulkResult?.status === 'complete' ? new Set((bulkResult.working_models || []).map(item=>item.id)) : null;
+    if (verifiedIds) models = models.filter(id=>verifiedIds.has(id));
+    let selectedModel = verifiedIds
+      ? (verifiedIds.has(profile?.model) ? profile.model : (models.find(id=>verifiedIds.has(id)) || ''))
+      : (models.includes(profile?.model) ? profile.model : '');
+    let freeOnly = false;
+    const modelChecks = new Map((state.verifiedModelsByProfile[profile.id] || []).map(item => [item.id, {state:'verified', message:'Passed the last full model-access check for this provider connection.'}]));
+    const profileName = escapeHTML(profile?.name || 'Provider connection');
+    const pricingFilter = profile?.provider === 'openrouter' ? `<select id="modelPriceFilter" aria-label="Filter by price"><option value="all">All models</option><option value="free" data-model-filter="free">Free variants only</option></select>` : '';
+    showModal(`<div class="modal-head"><div><h2>Choose a model</h2><div class="meta">${profileName}</div></div><button class="icon-button" data-close>×</button></div>
+      ${message && (!models.length || !['Models refreshed.','Live model list','Models refreshed from this connection.'].includes(message)) ? `<div id="modelNotice" class="modal-note model-discovery-warning">${escapeHTML(message)}</div>` : '<div id="modelNotice" class="modal-note model-discovery-warning" style="display:none"></div>'}
+      ${bulkResult?.status==='complete' && !models.length ? `<div class="model-selection-warning"><span>No model was confirmed. ${escapeHTML(formatFailureCategories(bulkResult.failure_categories) || 'Check the provider connection and retry.')}</span></div>` : ''}
+      <div class="model-modal-toolbar"><input id="modelSearch" type="search" placeholder="Search ${models.length} model IDs…" autocomplete="off">${pricingFilter}<button class="button subtle" id="refreshModelList" type="button">↻ Refresh models</button></div>
+      <div class="row-between model-list-caption"><span id="modelCount">${models.length} ${bulkResult?.status==='complete'?'verified working models':'model IDs listed · access not yet verified'}</span><span class="meta">Current: ${escapeHTML(profile?.model || 'not selected')}</span></div>
+      <div id="modelOptionsList" class="model-options-list"></div>
+      <div class="field full model-manual-field"><label>Or test an exact model ID manually</label><div class="model-manual-control"><input id="manualModelId" placeholder="Exact model ID from your provider" value=""><button type="button" class="button subtle" id="testManualModel">Test ID</button></div><small>Manual IDs are not treated as working until a test succeeds. Models that fail the latest full scan remain unselectable.</small></div>
+      <div class="modal-note">A model ID in this catalogue only proves the provider listed it. It does not prove your key, account tier, region, billing or quota can use it. Select a model, then choose <strong>Test access</strong> to send one tiny generation request (possible minimal charge). For Gemini 4 Argon, Google lists the model as unavailable on the free API tier: enable Gemini API billing in AI Studio. A Gemini app subscription does not replace API billing. <a href="https://ai.google.dev/gemini-api/docs/pricing" target="_blank" rel="noreferrer">Official pricing and tier details</a>. For OpenRouter, <code>:free</code> means a free route variant, but provider limits still apply.</div>
+      <div class="modal-actions"><button class="button subtle" data-close>Cancel</button><button class="button primary" id="saveDiscoveredModel">Use selected model</button></div>`);
+    const list = $('#modelOptionsList');
+    const search = $('#modelSearch');
+    const count = $('#modelCount');
+    const manual = $('#manualModelId');
+    const priceFilter = $('#modelPriceFilter');
+    function drawModels() {
+      const query = (search.value || '').trim().toLowerCase();
+      const visible = models.filter(model=>{
+        const entry = catalog.get(model) || {};
+        const matches = model.toLowerCase().includes(query) || String(entry.name||'').toLowerCase().includes(query);
+        return matches && (!freeOnly || entry.free_variant === true);
+      });
+      count.textContent = bulkResult?.status === 'complete'
+        ? `${visible.length} of ${models.length} verified working models`
+        : `${visible.length} of ${models.length} model IDs · access not yet verified`;
+      list.innerHTML = visible.length ? visible.map(model=>{
+        const entry = catalog.get(model) || {};
+        const status = entry.pricing_status || 'unknown';
+        const pill = status === 'free-variant' ? '<small class="model-price-pill free">FREE VARIANT</small>'
+          : status === 'paid' ? '<small class="model-price-pill paid">PAID</small>'
+          : status === 'zero-priced-may-require-credits' ? '<small class="model-price-pill unknown">$0 · CHECK CREDITS</small>'
+          : '<small class="model-price-pill unknown">PRICE UNKNOWN</small>';
+        const meta = escapeHTML(entry.pricing_label || 'Pricing not reported');
+        const check = modelChecks.get(model);
+        const accessLabel = check?.state === 'verified' ? 'ACCESS OK' : check?.state === 'blocked' ? 'ACCESS DENIED' : check?.state === 'billing' ? 'BILLING' : check?.state === 'quota' ? 'QUOTA' : check?.state === 'missing' ? 'NOT FOUND' : check?.state === 'invalid_key' ? 'BAD KEY' : check?.state === 'provider_down' ? 'PROVIDER DOWN' : check?.state === 'invalid_request' ? 'BAD MODEL/REQUEST' : check?.state === 'testing' ? 'TESTING…' : 'NOT TESTED';
+        const accessClass = check?.state || 'unverified';
+        const accessTitle = escapeHTML(check?.message || 'Catalogue entry only. Run Test access to check whether this account can invoke the model.');
+        return `<div class="model-option-row"><button type="button" class="model-option ${model===selectedModel?'selected':''}" data-model-option="${escapeHTML(model)}" aria-pressed="${model===selectedModel?'true':'false'}"><span class="model-option-main"><strong>${escapeHTML(entry.name || model)}</strong><small>${escapeHTML(model)}</small><small class="model-price-detail">${meta}</small></span><span class="model-option-tail">${pill}${model===profile?.model?'<small>Current</small>':model===selectedModel?'<small>Selected</small>':''}</span></button><div class="model-option-check"><span class="model-access-pill ${accessClass}" title="${accessTitle}">${accessLabel}</span><button type="button" class="button subtle model-check-button" data-check-model="${escapeHTML(model)}" ${check?.state==='testing'?'disabled':''}>${check?.state==='testing'?'Testing…':'Test access'}</button></div></div>`;
+      }).join('') : '<div class="quiet-note">No models match this filter. Try All models or refresh the catalogue.</div>';
+    }
+    search.addEventListener('input', drawModels);
+    priceFilter?.addEventListener('change',()=>{freeOnly=priceFilter.value==='free';drawModels();});
+    list.addEventListener('click', async event=>{
+      const checkButton=event.target.closest('[data-check-model]');
+      if (checkButton) {
+        const model=checkButton.dataset.checkModel;
+        modelChecks.set(model,{state:'testing',message:'Sending a minimal model access request…'}); drawModels();
+        try {
+          const result=await api(`/api/providers/${encodeURIComponent(profile.id)}/models/check`,{method:'POST',body:JSON.stringify({model})});
+          modelChecks.set(model,{state:'verified',message:result.message || 'This key/account accepted a generation request.'});
+          toast(`${model}: access verified`);
+        } catch(error) {
+          const stateName=error.status===401?'invalid_key':error.status===403?'blocked':error.status===402?'billing':error.status===429?'quota':error.status===404?'missing':error.status===503||error.status===502?'provider_down':error.status===400?'invalid_request':'error';
+          modelChecks.set(model,{state:stateName,message:error.message});
+          toast(`${model}: ${error.message}`);
+        }
+        drawModels(); return;
+      }
+      const option=event.target.closest('[data-model-option]'); if(!option) return;
+      selectedModel=option.dataset.modelOption; manual.value=''; drawModels();
+    });
+    manual.addEventListener('input',()=>{selectedModel=manual.value.trim()?'':(models.includes(profile?.model)?profile.model:'');drawModels();});
+    $('#testManualModel').addEventListener('click', async event=>{
+      const button=event.currentTarget;
+      const model=manual.value.trim();
+      if(!model){toast('Enter an exact model ID first.');manual.focus();return;}
+      button.disabled=true;button.textContent='Testing…';
+      modelChecks.set(model,{state:'testing',message:'Sending a minimal model access request…'});drawModels();
+      try{
+        const result=await api(`/api/providers/${encodeURIComponent(profile.id)}/models/check`,{method:'POST',body:JSON.stringify({model})});
+        modelChecks.set(model,{state:'verified',message:result.message || 'This key/account accepted a generation request.'});
+        if(!bulkResult || bulkResult.status!=='complete'){
+          bulkResult={status:'complete',total:0,checked:0,working_count:0,failed_count:0,failure_categories:{},manual_models:[],working_models:[],verified_at:Date.now(),manual_only:true};
+          state.bulkModelResults[profile.id]=bulkResult;
+          verifiedIds=new Set();
+          models=[];
+        }
+        verifiedIds?.add(model);
+        if(!models.includes(model))models.push(model);
+        models.sort((a,b)=>a.localeCompare(b,undefined,{sensitivity:'base'}));
+        if(!catalog.has(model))catalog.set(model,{id:model,name:model,pricing_status:'unknown',pricing_label:'Pricing not reported',free_variant:false});
+        const saved=state.bulkModelResults[profile.id];
+        saved.working_models=[...(saved.working_models||[]).filter(item=>item.id!==model),{id:model,name:model,status:'verified'}];
+        saved.manual_models=[...new Set([...(saved.manual_models||[]),model])];
+        saved.working_count=saved.working_models.length;
+        saved.verified_at=Date.now();
+        state.verifiedModelsByProfile[profile.id]=saved.working_models;
+        persistVerifiedModelResults(profile.id);
+        state.modelsByProfile[profile.id]=models;
+        state.modelCatalogByProfile[profile.id]=models.map(id=>catalog.get(id)||{id,name:id,pricing_status:'unknown',pricing_label:'Pricing not reported',free_variant:false});
+        selectedModel=model;manual.value='';
+        toast(`${model}: access verified and added to the working list`);
+      }catch(error){
+        const stateName=error.status===401?'invalid_key':error.status===403?'blocked':error.status===402?'billing':error.status===429?'quota':error.status===404?'missing':error.status===503||error.status===502?'provider_down':error.status===400?'invalid_request':'error';
+        modelChecks.set(model,{state:stateName,message:error.message});toast(`${model}: ${error.message}`);
+      }finally{button.disabled=false;button.textContent='Test ID';drawModels();}
+    });
+    $('#refreshModelList').addEventListener('click', async event=>{
+      const button=event.currentTarget; button.disabled=true; button.textContent='Refreshing…';
+      try {
+        const data=await api(`/api/providers/${encodeURIComponent(profile.id)}/models`);
+        const verifiedIds = state.bulkModelResults[profile.id]?.status==='complete'
+          ? new Set((state.verifiedModelsByProfile[profile.id] || []).map(item=>item.id)) : null;
+        const retainedManual = state.bulkModelResults[profile.id]?.manual_models || [];
+        models=[...new Set([...(data.models||[]).filter(Boolean).filter(id=>!verifiedIds || verifiedIds.has(id)), ...retainedManual])].sort((a,b)=>a.localeCompare(b,undefined,{sensitivity:'base'}));
+        catalog=new Map((data.catalog||[]).filter(item=>item?.id && (!verifiedIds || verifiedIds.has(item.id))).map(item=>[item.id,item]));
+        for (const id of models) if (!catalog.has(id)) catalog.set(id, {id, name:id, pricing_status:'unknown', pricing_label:'Pricing not exposed by provider', free_variant:false});
+        state.modelsByProfile[profile.id]=models; state.modelCatalogByProfile[profile.id]=[...(data.catalog || [])].filter(item=>!verifiedIds || verifiedIds.has(item.id));
+        search.placeholder=`Search ${models.length} model IDs…`; drawModels();
+        const notice=$('#modelNotice'); if(notice){notice.style.display=models.length?'none':'';notice.textContent=data.message || 'No model list was returned.';}
+        toast(models.length ? `Loaded ${models.length} provider-exposed models` : (data.message || 'No model list returned'));
+      } catch(error) { const notice=$('#modelNotice'); if(notice){notice.style.display='';notice.textContent=error.message;} toast(error.message); }
+      finally { const current=$('#refreshModelList'); if(current){current.disabled=false;current.textContent='↻ Refresh models';} }
+    });
+    $('#saveDiscoveredModel').addEventListener('click', async () => {
+      const model = manual.value.trim() || selectedModel;
+      if (!profile || !model) { toast('Choose a model or enter its exact ID.'); return; }
+      if (manual.value.trim() && modelChecks.get(model)?.state !== 'verified') { toast('Test this manual model ID successfully before selecting it.'); return; }
+      if (verifiedIds && !verifiedIds.has(model)) { toast('Choose a model that passed the latest access check.'); return; }
+      try {
+        if (model !== profile.model) {
+          const approved = await confirmModelSwitch(selectedProfile(), {...profile, model}, 'This changes the model saved on this connection. The active connection will not change unless you explicitly select it.');
+          if (!approved) return;
+        }
+        await api(`/api/providers/${encodeURIComponent(profile.id)}`,{method:'PUT',body:JSON.stringify({...profile,model,confirm_model_switch:true,enabled:profile.enabled!==false,auth_mode:profile.auth_mode || 'bearer',key_ids:profile.key_ids || [profile.key_id].filter(Boolean)})});
+        await loadProviders(); closeModal(); renderSidebar(); render(); toast(`Model set to ${model}`);
+      } catch(error) { toast(error.message); }
+    });
+    drawModels();
+  }
+
+  // --- Modal / navigation events -----------------------------------------
+  function showModal(html, modalClass = '') { const layer = $('#modalLayer'); layer.innerHTML = `<div class="modal ${escapeHTML(modalClass)}">${html}</div>`; layer.classList.remove('hidden'); layer.setAttribute('aria-hidden','false'); layer.querySelectorAll('[data-close]').forEach(b=>b.addEventListener('click',closeModal)); }
+  function closeModal() {
+    const layer = $('#modalLayer'); layer.classList.add('hidden'); layer.setAttribute('aria-hidden','true'); layer.innerHTML='';
+    if (pendingModelSwitchResolver) { const resolve = pendingModelSwitchResolver; pendingModelSwitchResolver = null; resolve(false); }
+  }
+  function confirmModelSwitch(currentProfile, nextProfile, reason = 'This changes which AI model receives your next request.') {
+    if (!nextProfile) return Promise.resolve(false);
+    const targetFingerprint = profile => JSON.stringify({
+      id: profile?.id || null,
+      provider: String(profile?.provider || '').trim().toLowerCase(),
+      model: String(profile?.model || '').trim(),
+      base_url: String(profile?.base_url || '').trim().replace(/\/+$/, ''),
+      auth_mode: profile?.auth_mode || 'bearer',
+      key_ids: Array.isArray(profile?.key_ids) ? profile.key_ids : (profile?.key_id ? [profile.key_id] : [])
+    });
+    if (currentProfile && targetFingerprint(currentProfile) === targetFingerprint(nextProfile)) return Promise.resolve(true);
+    const label = profile => profile ? `${providerName(profile.provider)} · ${profile.model || 'model not configured'} (${profile.name})${profile.base_url ? `\n${profile.base_url}` : ''}` : 'No model currently selected';
+    return new Promise(resolve => {
+      pendingModelSwitchResolver = resolve;
+      showModal(`<div class="modal-head"><div><span class="modal-eyebrow">MODEL SWITCH PERMISSION</span><h2>Allow model change?</h2></div><button class="icon-button" type="button" data-close aria-label="Close">×</button></div>
+        <div class="model-switch-summary"><div class="model-switch-from"><small>CURRENT SELECTION</small><strong>${escapeHTML(label(currentProfile))}</strong></div><div class="model-switch-arrow" aria-hidden="true">↓</div><div class="model-switch-to"><small>PROPOSED SELECTION</small><strong>${escapeHTML(label(nextProfile))}</strong></div></div>
+        <p class="modal-note">${escapeHTML(reason)}</p><p class="modal-note">Spaceline will not change the active model unless you approve. If you decline, your current selection stays active and the request will not be rerouted.</p>
+        <div class="modal-actions"><button type="button" class="button subtle" data-confirm-model-switch="cancel">Keep current model</button><button type="button" class="button primary" data-confirm-model-switch="approve">Approve switch</button></div>`);
+      $('#modalLayer').querySelectorAll('[data-confirm-model-switch]').forEach(button => button.addEventListener('click', () => {
+        const approved = button.dataset.confirmModelSwitch === 'approve';
+        const finish = pendingModelSwitchResolver; pendingModelSwitchResolver = null;
+        closeModal(); if (finish) finish(approved);
+      }));
+    });
+  }
+
+  function setupCustomCursor() {
+    const cursor = $('#spacelineCursor');
+    if (!cursor || reduceMotion || !window.matchMedia?.('(hover: hover) and (pointer: fine)').matches) return;
+    document.addEventListener('pointermove', event => {
+      cursor.style.left = `${event.clientX}px`;
+      cursor.style.top = `${event.clientY}px`;
+      cursor.classList.add('visible');
+      cursor.classList.toggle('interactive', Boolean(event.target.closest('button,a,input,textarea,select,[role="button"]')));
+    }, {passive:true});
+    document.addEventListener('pointerleave', () => cursor.classList.remove('visible'));
+  }
+
+  function bindGlobal() {
+    $$('.nav-item').forEach(button => button.addEventListener('click', async () => {
+      if (button.dataset.view === 'chat') { state.activeChatId=null; state.activeChat=null; }
+      if (button.dataset.view === 'artifacts') await loadNotes();
+      if (button.dataset.view === 'projects') { await loadProjects(); state.files=[]; }
+      navigate(button.dataset.view);
+    }));
+    $$('.mode').forEach(button => button.addEventListener('click', async () => {
+      state.mode = button.dataset.mode;
+      if (state.mode === 'code') { await loadProjects(); if(!state.selectedProject && state.projects.length) state.selectedProject=state.projects[0]; await loadProjectFiles(); state.view='projects'; }
+      else { state.view='chat'; }
+      renderSidebar(); render();
+    }));
+    $('#sidebarToggle').addEventListener('click', () => { state.collapsed=!state.collapsed; $('#sidebar').classList.toggle('collapsed',state.collapsed); saveWorkspacePreferences(); });
+    $('#quickProvider').addEventListener('click', () => { state.view='customize';state.customizeTab='providers';renderSidebar();render(); });
+    $('#openCommandPalette')?.addEventListener('click', openCommandPalette);
+    $('#openCustomize').addEventListener('click', () => { state.view='customize';state.customizeTab='providers';renderSidebar();render(); });
+    $('#openImageStudio')?.addEventListener('click', () => navigate('images'));
+    $('#openLivePreview')?.addEventListener('click', async () => {
+      if (state.editorDirty) {
+        const saved = state.view === 'projects' ? await saveProjectFile() : await saveWorkbenchEditor(false);
+        if (!saved) { toast('Save failed. Preview was not opened.'); return; }
+      }
+      state.workbenchTab='preview'; state.workbenchCollapsed=false; saveWorkspacePreferences();
+      if (state.view !== 'chat') { state.view='chat'; renderSidebar(); render(); }
+      else { refreshWorkbench(); $('#chatWorkspace')?.classList.remove('workbench-collapsed'); }
+    });
+    $('#footerSettings').addEventListener('click', () => { state.view='customize';state.customizeTab='providers';renderSidebar();render(); });
+    $('#refreshChats').addEventListener('click', refreshChats);
+    $('#viewAllChats').addEventListener('click', () => navigate('search'));
+    $('#taskList').addEventListener('click', event => { const deleteButton=event.target.closest('[data-chat-delete]'); if(deleteButton){deleteChat(deleteButton.dataset.chatDelete);return;} const button=event.target.closest('[data-chat-open]'); if(button) openChat(button.dataset.chatOpen); });
+    $('#modalLayer').addEventListener('click', event => { if(event.target.id==='modalLayer') closeModal(); });
+    document.addEventListener('click', event => { if (!event.target.closest('.composer-plus-wrap')) closeToolsMenu(); });
+    document.addEventListener('keydown', event => {
+      if((event.ctrlKey||event.metaKey)&&!event.shiftKey&&event.key.toLowerCase()==='s'){
+        const target = event.target;
+        if(target?.id==='workbenchCodeEditor' || target?.id==='codeEditor'){ event.preventDefault(); if(target.id==='workbenchCodeEditor') saveWorkbenchEditor(true); else saveProjectFile(); }
+      }
+      if(event.key==='Escape'){closeToolsMenu();if(!$('#modalLayer').classList.contains('hidden')) closeModal();}
+      if((event.ctrlKey||event.metaKey)&&!event.shiftKey&&event.key.toLowerCase()==='k'){event.preventDefault();if($('#modalLayer').classList.contains('hidden'))openCommandPalette();}
+      if((event.ctrlKey||event.metaKey)&&event.shiftKey&&event.key.toLowerCase()==='f'){event.preventDefault();navigate('search');setTimeout(()=>$('#chatSearch')?.focus(),0);}
+    });
+  }
+
+  loadWorkspacePreferences();
+  $('#sidebar')?.classList.toggle('collapsed', state.collapsed);
+  bindGlobal();
+  setupCustomCursor();
+  boot();
+})();
