@@ -1,5 +1,16 @@
 # Spaceline 0.9.6
 
+## Download, installation, and Windows security
+
+**Windows download:** get the current installer from the [Spaceline GitHub Releases page](https://github.com/srijanmuddam16-hub/spaceline_workspace/releases). The current published release is **v0.9.6** and includes `Spaceline-Setup-0.9.6.exe`. Follow [Windows installation](INSTALL_WINDOWS.md) for setup details.
+
+**Important security notice:** the currently published EXE installer is not code-signed. Windows Smart App Control may block an unsigned installer when its reputation service cannot verify it. GitHub hosting does not remove that warning, and Windows does not provide a per-app Smart App Control exception. Do not disable Windows security or install a certificate from an untrusted source to work around this. We are evaluating trusted, no-cost distribution/signing routes; until one is approved and implemented, users whose Windows device blocks the installer should not attempt to bypass the protection.
+
+**Code signing policy:** Spaceline's current v0.9.6 Windows installer is unsigned. No third-party signing provider has been approved or used for this release. Any future signed release will identify the signing provider and provide signature-verification instructions here and on its release page.
+
+**Project integrity:** download releases only from the repository linked above. Review the source and release notes before installing. Never share your Firebase service-account credentials, OAuth client secrets, API keys, or local `.env` file in an issue, public commit, or release.
+
+
 ## Login and Firebase repair
 
 - Added the supplied Spaceline SVG mark to the sign-in and workspace branding.
